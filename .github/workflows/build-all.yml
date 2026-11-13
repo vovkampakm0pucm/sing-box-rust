@@ -1,4 +1,4 @@
-name: Build OpenWrt aarch64
+name: Build OpenWrt Platforms
 
 on:
   workflow_dispatch:
