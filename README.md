@@ -8,7 +8,7 @@
 Hysteria2, WireGuard/AmneziaWG, MASQUE, Tailscale и HTTP; транспорты и
 TLS/uTLS/REALITY общие для VLESS и Trojan.
 
-Поддерживаемые платформы: **OpenWrt x86_64 и aarch64_cortex-a53**.
+Поддерживаемые платформы: **OpenWrt aarch64**.
 CI выполняет Linux-тесты и статические musl-сборки этих двух архитектур.
 Другие ОС и архитектуры не входят в поддержку нашего форка.
 
