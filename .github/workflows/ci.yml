@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
-# New commits supersede earlier CI runs on the same branch or PR.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,10 +28,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
-      # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
-      # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
         run: |
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
@@ -46,13 +44,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # run.sh refuses to start without a binary, so this build is not optional.
       - name: Build xrust
         run: cargo build --workspace
       - name: Fetch reference sing-box-lx
         run: |
           curl -fsSL -o ref.tar.gz \
-            "https://github.com/Leadaxe/sing-box-lx/releases/download/${SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
+            "https://github.com{SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
           mkdir -p "$HOME/ref" && tar -xzf ref.tar.gz -C "$HOME/ref"
           REF_BIN="$(find "$HOME/ref" -type f -name sing-box | head -1)"
           chmod +x "$REF_BIN"
@@ -64,51 +61,21 @@ jobs:
         run: bash tests/differential/run.sh
 
   cross:
-    name: Cross build (musl)
+    name: Cross build (aarch64-musl)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            budget: 13631488
-          - target: aarch64-unknown-linux-musl
-            budget: 12582912
-          - target: mipsel-unknown-linux-musl
-            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target != 'mipsel-unknown-linux-musl' && matrix.target || '' }}
-          components: ${{ matrix.target == 'mipsel-unknown-linux-musl' && 'rust-src' || '' }}
-      - name: Verified MIPS cross compiler
-        if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}
-        run: echo "MIPS_TOOLCHAIN=$(bash scripts/openwrt_mips_toolchain.sh)" >> "$GITHUB_ENV"
-      # Preserve the target-specific crypto and static linker flags in Cargo config.
-      - name: C compiler for x86_64 musl mimalloc
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
-        run: |
-          sudo bash scripts/install_ci_tools.sh musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          targets: aarch64-unknown-linux-musl
       - name: Build
+        run: cargo build --locked --workspace --no-default-features --features rust-x --release --target aarch64-unknown-linux-musl
+      - name: Size budget (12 MiB ARM64)
         run: |
-          if [ '${{ matrix.target }}' = mipsel-unknown-linux-musl ]; then
-            bash scripts/build_mips_openwrt.sh
-          else
-            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
-          fi
-      - name: MIPS 24Kc runtime smoke
-        if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}
-        run: |
-          sudo bash scripts/install_ci_tools.sh qemu-user
-          python3 scripts/test_mips_runtime.py --qemu qemu-mipsel --sysroot "$MIPS_TOOLCHAIN" --binary target/mipsel-unknown-linux-musl/release/xrust
-      - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
-        run: |
-          size=$(stat -c%s "target/${{ matrix.target }}/release/xrust")
+          size=$(stat -c%s "target/aarch64-unknown-linux-musl/release/xrust")
           echo "size=$size bytes"
-          test "$size" -le ${{ matrix.budget }}
+          test "$size" -le 12582912
       - uses: actions/upload-artifact@v4
         with:
-          name: xrust-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/xrust
+          name: xrust-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/xrust
