@@ -1,4 +1,4 @@
-name: Build OpenWrt Platforms
+name: Build OpenWrt aarch64
 
 on:
   workflow_dispatch:
@@ -19,75 +19,29 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
+    name: aarch64-musl
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: x86_64-musl
-            target: x86_64-unknown-linux-musl
-            budget: 13631488
-          - name: aarch64-musl
-            target: aarch64-unknown-linux-musl
-            budget: 12582912
-          - name: mipsel-musl
-            target: mipsel-unknown-linux-musl
-            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target != 'mipsel-unknown-linux-musl' && matrix.target || '' }}
-          components: ${{ matrix.target == 'mipsel-unknown-linux-musl' && 'rust-src' || '' }}
-      - name: Verified MIPS cross compiler
-        if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}
-        run: echo "MIPS_TOOLCHAIN=$(bash scripts/openwrt_mips_toolchain.sh)" >> "$GITHUB_ENV"
-      - name: C compiler for x86_64 musl mimalloc
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
-        run: |
-          sudo bash scripts/install_ci_tools.sh musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          targets: aarch64-unknown-linux-musl
       - name: Build
-        run: |
-          if [ '${{ matrix.target }}' = mipsel-unknown-linux-musl ]; then
-            bash scripts/build_mips_openwrt.sh
-          else
-            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
-          fi
-      - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
-        run: test "$(stat -c%s target/${{ matrix.target }}/release/xrust)" -le ${{ matrix.budget }}
+        run: cargo build --locked --workspace --no-default-features --features rust-x --release --target aarch64-unknown-linux-musl
+      - name: Size budget (12 MiB ARM64)
+        run: test "$(stat -c%s target/aarch64-unknown-linux-musl/release/xrust)" -le 12582912
       - name: Architecture check
-        run: file target/${{ matrix.target }}/release/xrust
+        run: file target/aarch64-unknown-linux-musl/release/xrust
       - name: Pack
         run: |
-          name="rust-x-${{ matrix.name }}"
-          cp "target/${{ matrix.target }}/release/xrust" "$name"
+          name="rust-x-aarch64-musl"
+          cp "target/aarch64-unknown-linux-musl/release/xrust" "$name"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: aarch64-musl
           path: |
-            rust-x-${{ matrix.name }}.tar.gz
-            rust-x-${{ matrix.name }}.tar.gz.sha256
+            rust-x-aarch64-musl.tar.gz
+            rust-x-aarch64-musl.tar.gz.sha256
           if-no-files-found: error
-
-  summary:
-    name: Package checksums
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Verify checksums
-        run: |
-          cd artifacts
-          cat ./*.sha256 > SHA256SUMS
-          sha256sum -c SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SHA256SUMS
-          path: artifacts/SHA256SUMS
