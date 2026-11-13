@@ -1,0 +1,2415 @@
+From cfc920b7944534527be3f6bb87513e2c78aa91a6 Mon Sep 17 00:00:00 2001
+From: Local User <user@localhost>
+Date: Fri, 13 Nov 2026 17:17:58 +0000
+Subject: [PATCH] Enable VMess outbound in Xrust 0.0.40
+
+---
+ Cargo.lock                                    |  23 +
+ Cargo.toml                                    |   3 +
+ crates/core-config/src/validate.rs            |  29 +-
+ crates/core-runtime/Cargo.toml                |   4 +
+ crates/core-runtime/src/clash_api.rs          |   1 +
+ crates/core-runtime/src/outbound/mod.rs       |   1 +
+ .../src/outbound/vmess/framing.rs             | 994 ++++++++++++++++++
+ crates/core-runtime/src/outbound/vmess/kdf.rs | 221 ++++
+ crates/core-runtime/src/outbound/vmess/mod.rs | 607 +++++++++++
+ .../core-runtime/src/outbound/vmess/wire.rs   | 239 +++++
+ crates/core-runtime/src/route/mod.rs          |   6 +
+ 11 files changed, 2122 insertions(+), 6 deletions(-)
+ create mode 100644 crates/core-runtime/src/outbound/vmess/framing.rs
+ create mode 100644 crates/core-runtime/src/outbound/vmess/kdf.rs
+ create mode 100644 crates/core-runtime/src/outbound/vmess/mod.rs
+ create mode 100644 crates/core-runtime/src/outbound/vmess/wire.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 077792d..589206f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -199,6 +199,15 @@ dependencies = [
+  "shlex",
+ ]
+ 
++[[package]]
++name = "cfb-mode"
++version = "0.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "738b8d467867f80a71351933f70461f5b56f24d5c93e0cf216e59229c968d330"
++dependencies = [
++ "cipher",
++]
++
+ [[package]]
+ name = "cfg-if"
+ version = "1.0.5"
+@@ -363,8 +372,10 @@ dependencies = [
+  "blake2",
+  "blake3",
+  "bytes",
++ "cfb-mode",
+  "chacha20 0.9.1",
+  "chacha20poly1305",
++ "cipher",
+  "core-config",
+  "core-crypto",
+  "core-experimental",
+@@ -383,6 +394,7 @@ dependencies = [
+  "if-addrs",
+  "libc",
+  "lru",
++ "md-5",
+  "ml-kem",
+  "portable-atomic",
+  "quinn",
+@@ -394,6 +406,7 @@ dependencies = [
+  "serde_json",
+  "sha1",
+  "sha2",
++ "sha3",
+  "smoltcp",
+  "socket2",
+  "tokio",
+@@ -1385,6 +1398,16 @@ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
+ 
++[[package]]
++name = "md-5"
++version = "0.10.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
++dependencies = [
++ "cfg-if",
++ "digest 0.10.7",
++]
++
+ [[package]]
+ name = "memchr"
+ version = "2.8.3"
+diff --git a/Cargo.toml b/Cargo.toml
+index 183938a..5d55fbf 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -52,6 +52,7 @@ base64 = "0.22"
+ blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
+ brotli = "9"
+ bytes = "1"
++cfb-mode = "0.8"
+ chacha20poly1305 = "0.10"
+ ml-kem = "0.2"
+ ctr = "0.9"
+@@ -69,6 +70,7 @@ hmac = "0.12"
+ http = "1"
+ # interface addresses for the mDNS transport's per-interface sockets
+ if-addrs = "0.15"
++md-5 = "0.10"
+ libc = "0.2"
+ # true LRU for the dns response cache: eviction was a full scan of the map
+ lru = "0.12"
+@@ -81,6 +83,7 @@ aho-corasick = "1"
+ rustls-pemfile = "2"
+ sha1 = "0.10"
+ sha2 = "0.10"
++sha3 = "0.10"
+ smoltcp = { version = "0.14", default-features = false }
+ x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+ tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+diff --git a/crates/core-config/src/validate.rs b/crates/core-config/src/validate.rs
+index d68aced..bbed7d4 100644
+--- a/crates/core-config/src/validate.rs
++++ b/crates/core-config/src/validate.rs
+@@ -433,6 +433,7 @@ const LEGACY_INBOUND_ERROR: &str = "legacy inbound fields are deprecated in sing
+ /// carrying a plain-string `server` (snell/anytls/masque validate their own).
+ const SERVER_OUT_BASES: &[(&str, &str)] = &[
+     ("http", "HTTPOutboundOptions"),
++    ("vmess", "VMessOutboundOptions"),
+     ("vless", "VLESSOutboundOptions"),
+     ("trojan", "TrojanOutboundOptions"),
+     ("hysteria", "HysteriaOutboundOptions"),
+@@ -3746,7 +3747,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
+                     let removed = matches!(
+                         ty,
+                         "naive"
+-                            | "vmess"
++                           
+                             | "shadowsocks"
+                             | "tuic"
+                             | "anytls"
+@@ -3756,8 +3757,8 @@ pub fn validate(root: &Value) -> Result<(), String> {
+                             | "openvpn"
+                             | "openvpn-client"
+                     ) || (section == "outbounds" && ty == "socks")
+-                        // the trojan client is in; a trojan server is not
+-                        || (section != "outbounds" && ty == "trojan");
++                        // the trojan and vmess clients are in; their servers are not
++                        || (section != "outbounds" && matches!(ty, "trojan" | "vmess"));
+                     if removed {
+                         return Err(format!(
+                             "{section}[{i}]: protocol {ty:?} is excluded from Rust X"
+@@ -5706,6 +5707,19 @@ fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> R
+ 
+ /// Decode for the plain outbounds without a bespoke validator: allowed-field
+ /// rejection + per-type value checks + shared dialer/tls containers.
++const VMESS_OUT_FIELDS: &[&str] = &[
++    "uuid",
++    "security",
++    "alter_id",
++    "global_padding",
++    "authenticated_length",
++    "network",
++    "tls",
++    "packet_encoding",
++    "multiplex",
++    "transport",
++];
++
+ fn validate_plain_out_decode(
+     i: usize,
+     ty: &str,
+@@ -5715,6 +5729,7 @@ fn validate_plain_out_decode(
+     let at = format!("outbounds[{i}]");
+     let (protocol, go_base, has_tls, has_quic): (&[&str], &str, bool, bool) = match ty {
+         "http" => (HTTP_OUT_FIELDS, "HTTPOutboundOptions", true, false),
++        "vmess" => (VMESS_OUT_FIELDS, "VMessOutboundOptions", true, false),
+         "vless" => (VLESS_OUT_FIELDS, "VLESSOutboundOptions", true, false),
+         "trojan" => (TROJAN_OUT_FIELDS, "TrojanOutboundOptions", true, false),
+         "hysteria" => (HYSTERIA_OUT_FIELDS, "HysteriaOutboundOptions", true, true),
+@@ -5734,6 +5749,7 @@ fn validate_plain_out_decode(
+ 
+     let strings: &[&str] = match ty {
+         "http" => &["username", "password", "path"],
++        "vmess" => &["uuid", "security", "packet_encoding"],
+         "vless" => &["uuid", "flow", "encryption", "packet_encoding"],
+         "trojan" => &["password"],
+         "ssh" => &[
+@@ -5752,6 +5768,7 @@ fn validate_plain_out_decode(
+         }
+     }
+     for f in match ty {
++        "vmess" => &["alter_id"][..],
+         "hysteria" => &["up_mbps", "down_mbps", "recv_window_conn", "recv_window"][..],
+         _ => &[],
+     } {
+@@ -5759,7 +5776,7 @@ fn validate_plain_out_decode(
+             check_int_field(v, &format!("{at}.{f}"), go_base, f)?;
+         }
+     }
+-    if matches!(ty, "vless" | "trojan" | "hysteria")
++    if matches!(ty, "vmess" | "vless" | "trojan" | "hysteria")
+         && let Some(v) = obj.get("network")
+     {
+         snell_network(v, &format!("{at}.network"), go_base)?;
+@@ -5793,7 +5810,7 @@ fn validate_plain_out_decode(
+     {
+         check_http_header(v, &format!("{at}.headers"), go_base, "headers")?;
+     }
+-    if matches!(ty, "vless" | "trojan")
++    if matches!(ty, "vmess" | "vless" | "trojan")
+         && let Some(v) = obj.get("multiplex")
+     {
+         // the reference switches on the protocol name whatever `enabled` says
+@@ -6102,7 +6119,7 @@ fn validate_outbound(
+     match ty {
+         "hysteria2" => validate_hy2_out_decode(i, obj)?,
+         "masque" => validate_masque_out_decode(i, obj)?,
+-        "http" | "vless" | "trojan" | "hysteria" | "ssh" => {
++        "http" | "vmess" | "vless" | "trojan" | "hysteria" | "ssh" => {
+             validate_plain_out_decode(i, ty, tag, obj)?;
+             if ty == "vless" {
+                 validate_vless_encryption(i, obj)?;
+diff --git a/crates/core-runtime/Cargo.toml b/crates/core-runtime/Cargo.toml
+index ed65ebc..ca9bb49 100644
+--- a/crates/core-runtime/Cargo.toml
++++ b/crates/core-runtime/Cargo.toml
+@@ -42,6 +42,7 @@ base64.workspace = true
+ blake2.workspace = true
+ blake3.workspace = true
+ bytes.workspace = true
++cfb-mode.workspace = true
+ chacha20 = "0.9"
+ crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+ chacha20poly1305.workspace = true
+@@ -62,12 +63,14 @@ hmac.workspace = true
+ http.workspace = true
+ # raw DEFLATE for the external_ui bundle; miniz_oxide keeps it pure Rust
+ flate2.workspace = true
++md-5.workspace = true
+ quinn.workspace = true
+ regex.workspace = true
+ aho-corasick.workspace = true
+ rustls-pemfile.workspace = true
+ sha1.workspace = true
+ sha2.workspace = true
++sha3.workspace = true
+ tokio-rustls.workspace = true
+ tokio = { version = "1", features = [
+     "rt-multi-thread",
+@@ -80,6 +83,7 @@ tokio = { version = "1", features = [
+ ] }
+ socket2 = { version = "0.6", features = ["all"] }
+ lru.workspace = true
++cipher = "0.4"
+ # 64-bit atomics on mips32: std::sync::atomic::AtomicU64 does not exist
+ # there and the mips build dies on the import. On every target that has
+ # native LL/SC for 64 bits this is the same type std uses, so nothing
+diff --git a/crates/core-runtime/src/clash_api.rs b/crates/core-runtime/src/clash_api.rs
+index 02a0cba..0ae2260 100644
+--- a/crates/core-runtime/src/clash_api.rs
++++ b/crates/core-runtime/src/clash_api.rs
+@@ -1484,6 +1484,7 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
+         Outbound::Http(_) => "HTTP",
+         Outbound::Vless(_) => "VLESS",
+         Outbound::Trojan(_) => "Trojan",
++        Outbound::Vmess(_) => "VMess",
+         Outbound::Hysteria2(_) => "Hysteria2",
+         Outbound::Masque(_) => "MASQUE",
+         Outbound::WireGuard(_) => "WireGuard",
+diff --git a/crates/core-runtime/src/outbound/mod.rs b/crates/core-runtime/src/outbound/mod.rs
+index 71d8b44..003a79e 100644
+--- a/crates/core-runtime/src/outbound/mod.rs
++++ b/crates/core-runtime/src/outbound/mod.rs
+@@ -14,4 +14,5 @@ pub mod transport;
+ pub mod urltest;
+ pub mod vision;
+ pub mod vless_enc;
++pub mod vmess;
+ pub mod wireguard;
+diff --git a/crates/core-runtime/src/outbound/vmess/framing.rs b/crates/core-runtime/src/outbound/vmess/framing.rs
+new file mode 100644
+index 0000000..1f16d6e
+--- /dev/null
++++ b/crates/core-runtime/src/outbound/vmess/framing.rs
+@@ -0,0 +1,994 @@
++//! VMess body framing: SHAKE128 length masking/padding, body AEAD
++//! (aes-128-gcm / chacha20-poly1305 with BE16-counter nonces), the
++//! authenticated-length (`auth_len`) variant, the legacy aes-128-cfb body
++//! with FNV1a-32 chunk checksums, and the incremental frame assembler for
++//! the download direction.
++
++use std::io;
++use std::task::{Context, Poll};
++
++use aes::Aes128;
++use aes_gcm::aead::{AeadInPlace, KeyInit};
++use cfb_mode::cipher::KeyIvInit;
++use cfb_mode::{BufDecryptor, BufEncryptor};
++use chacha20poly1305::ChaCha20Poly1305;
++use sha3::digest::{ExtendableOutput, Update, XofReader};
++use sha3::{Shake128, Shake128Reader};
++use tokio::io::{AsyncRead, ReadBuf};
++
++use core_crypto::fastgcm::Gcm;
++use crate::inbound::AnyStream;
++use crate::util::random_bytes;
++use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
++
++/// One frame's worth of plaintext. The length field is a `u16`, but the chunk
++/// must also fit the far end's read buffer whole: the reference server reads
++/// an AEAD chunk in one piece into a fixed 16 KiB-class buffer and answers a
++/// bigger one with `short buffer: stream chunk need N` -- the length field is
++/// not the limit, the reader's buffer is. 16 305 + tag = 16 321, inside the
++/// 16 KiB window; the raise to a `u16`-sized chunk that once lived here broke
++/// every reference server, so it is not coming back.
++pub(crate) const WRITE_CHUNK: usize = 16 * 1024 - CIPHER_OVERHEAD - (MAX_PADDING as usize - 1);
++/// How much of one `write` is framed into one buffer and leaves in one syscall:
++/// the 128 KiB the relay hands over at a time, whole. The batch used to be four
++/// chunks -- 65 220 bytes -- so every relay read left as two stage/write pairs
++/// and a single-connection transfer ran on one stage's worth of in-flight data,
++/// 64 KiB against the stream's round trip: vmess-grpc capped at 1.7 Gbit/s
++/// where the reference with its bigger pipeline ran at 2.9. Batch, hunk and
++/// in-flight are the same number now.
++pub(crate) const WRITE_BATCH: usize = 128 * 1024;
++
++/// [`WRITE_BATCH`], with `XRUST_VMESS_BATCH` as a diagnostic override: the
++/// batch sets how many bytes one vmess frame -- and therefore one grpc message
++/// downstream -- carries, so shrinking it lets the bench reproduce the
++/// reference's message size against our own server.
++pub(crate) fn write_batch() -> usize {
++    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *SIZE.get_or_init(|| {
++        crate::env_var("VMESS_BATCH")
++            .and_then(|v| v.parse::<usize>().ok())
++            .filter(|v| *v >= 4096)
++            .unwrap_or(WRITE_BATCH)
++    })
++}
++const CIPHER_OVERHEAD: usize = 16;
++const MAX_PADDING: u16 = 64;
++
++/// Read-ahead the frame buffer aims for: enough that one read brings in several
++/// chunks rather than the two bytes of a length block.
++const READ_CHUNK: usize = 64 * 1024;
++/// Hard ceiling on the frame buffer: one whole chunk (a `u16` of ciphertext plus
++/// its tag) behind the length block, plus the read-ahead.
++///
++/// The buffer used to be grown with `Vec::reserve` every time it filled, and
++/// `reserve` rounds up to twice the capacity -- so a connection that carried a
++/// gigabyte ended up holding a buffer to match, hundreds of megabytes of pages
++/// that had to be faulted in and copied. It is now sized in one step, to what
++/// the read needs and never past this.
++const FRAME_ROOM: usize = 2 + CIPHER_OVERHEAD + u16::MAX as usize + READ_CHUNK;
++
++/// Only these two securities seal the body; `none` frames it in the clear.
++fn has_aead(security: u8) -> bool {
++    security == super::SEC_AES128_GCM || security == super::SEC_CHACHA20_POLY1305
++}
++
++pub(crate) type CfbEncrypt = BufEncryptor<Aes128>;
++pub(crate) type CfbDecrypt = BufDecryptor<Aes128>;
++
++/// `GenerateChunkNonce`: nonce = BE16(counter) || iv[2..12].
++fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
++    let mut nonce = [0u8; 12];
++    nonce[..2].copy_from_slice(&counter.to_be_bytes());
++    nonce[2..].copy_from_slice(&iv[2..12]);
++    nonce
++}
++
++/// Body cipher; chacha keys expand via `GenerateChacha20Poly1305Key`.
++pub(crate) enum BodyAead {
++    Aes(Gcm),
++    ChaCha(ChaCha20Poly1305),
++}
++
++impl BodyAead {
++    pub(crate) fn new(security: u8, key16: &[u8; 16]) -> Self {
++        if security == super::SEC_CHACHA20_POLY1305 {
++            Self::ChaCha(
++                ChaCha20Poly1305::new_from_slice(&chacha_key(key16)).expect("chacha key length"),
++            )
++        } else {
++            Self::Aes(Gcm::new(key16))
++        }
++    }
++
++    /// Keyed with KDF16(key, "auth_len"); cipher type follows the body security.
++    pub(crate) fn auth_len(security: u8, key16: &[u8; 16]) -> Self {
++        Self::new(security, &kdf16(key16, &[b"auth_len"]))
++    }
++
++    /// Seal `buf[from..]` where it lies and append the tag: a frame is built in
++    /// one buffer instead of a copy of the plaintext per chunk.
++    pub(crate) fn seal_from(
++        &self,
++        counter: u16,
++        iv: &[u8; 16],
++        buf: &mut Vec<u8>,
++        from: usize,
++    ) -> io::Result<()> {
++        let nonce = chunk_nonce(iv, counter);
++        let tag: [u8; 16] = match self {
++            BodyAead::Aes(cipher) => cipher.seal(&nonce, &[], &mut buf[from..]),
++            BodyAead::ChaCha(cipher) => cipher
++                .encrypt_in_place_detached((&nonce).into(), &[], &mut buf[from..])
++                .map_err(|_| io::Error::other("seal failed"))?
++                .into(),
++        };
++        buf.extend_from_slice(&tag);
++        Ok(())
++    }
++
++    /// Open one `[ciphertext || tag]` block where it lies, leaving the plaintext
++    /// in its place, and say how many bytes of it there are.
++    ///
++    /// A block, not a buffer: the assembler reads ahead, so the length block sits
++    /// at the front of a buffer that already holds the chunk behind it, and a
++    /// version that truncated the buffer would throw that read-ahead away on
++    /// every chunk.
++    pub(crate) fn open(&self, counter: u16, iv: &[u8; 16], block: &mut [u8]) -> io::Result<usize> {
++        if block.len() < CIPHER_OVERHEAD {
++            return Err(io::Error::other("chunk too short"));
++        }
++        let nonce = chunk_nonce(iv, counter);
++        let split = block.len() - CIPHER_OVERHEAD;
++        let (data, tag) = block.split_at_mut(split);
++        let tag: [u8; 16] = (*tag).try_into().expect("tag is 16 bytes");
++        let ok = match self {
++            BodyAead::Aes(cipher) => cipher.open(&nonce, &[], data, &tag),
++            BodyAead::ChaCha(cipher) => cipher
++                .decrypt_in_place_detached((&nonce).into(), &[], data, (&tag).into())
++                .is_ok(),
++        };
++        if !ok {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "chunk auth failed",
++            ));
++        }
++        Ok(split)
++    }
++}
++
++/// Per-direction SHAKE128 stream seeded with that direction's IV; draws pad
++/// lengths first, then masks, sharing one instance when both are enabled.
++pub(crate) struct Shake(Shake128Reader);
++
++impl Shake {
++    pub(crate) fn new(seed: &[u8; 16]) -> Self {
++        let mut hash = Shake128::default();
++        hash.update(seed);
++        Self(hash.finalize_xof())
++    }
++
++    pub(crate) fn next_u16(&mut self) -> u16 {
++        let mut buf = [0u8; 2];
++        self.0.read(&mut buf);
++        u16::from_be_bytes(buf)
++    }
++}
++
++/// Upload frame builder (stream-chunk, auth-len, or legacy checksum variant).
++pub(crate) struct BodyWriter {
++    body: Option<BodyAead>,
++    body_iv: [u8; 16],
++    body_count: u16,
++    auth: Option<BodyAead>,
++    auth_iv: [u8; 16],
++    auth_count: u16,
++    shake: Option<Shake>,
++    global_padding: bool,
++    chunk_masking: bool,
++    authenticated_length: bool,
++    /// Legacy body: CFB-128 stream over requestKey/requestIV; frames carry a
++    /// FNV1a-32 checksum prefix instead of AEAD protection.
++    cfb: Option<CfbEncrypt>,
++    checksum: bool,
++}
++
++impl BodyWriter {
++    pub(crate) fn new(
++        security: u8,
++        request_key: &[u8; 16],
++        request_iv: &[u8; 16],
++        global_padding: bool,
++        chunk_masking: bool,
++        authenticated_length: bool,
++    ) -> Self {
++        let legacy = security == super::SEC_LEGACY;
++        Self {
++            body: has_aead(security).then(|| BodyAead::new(security, request_key)),
++            body_iv: *request_iv,
++            body_count: 0,
++            auth: (!legacy && authenticated_length)
++                .then(|| BodyAead::auth_len(security, request_key)),
++            auth_iv: *request_iv,
++            auth_count: 0,
++            shake: (!legacy && (global_padding || chunk_masking)).then(|| Shake::new(request_iv)),
++            global_padding: !legacy && global_padding,
++            chunk_masking: !legacy && chunk_masking,
++            authenticated_length: !legacy && authenticated_length,
++            cfb: legacy.then(|| {
++                CfbEncrypt::new_from_slices(request_key, request_iv).expect("cfb key/iv length")
++            }),
++            checksum: legacy,
++        }
++    }
++
++    /// One frame for one chunk of plaintext (`data.len() <= WRITE_CHUNK`),
++    /// appended to `out`, so several chunks of one write leave in one buffer and
++    /// one syscall, and the plaintext is sealed where it lies.
++    pub(crate) fn frame_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
++        debug_assert!(!data.is_empty() && data.len() <= WRITE_CHUNK);
++
++        if self.checksum {
++            let from = out.len();
++            out.extend_from_slice(&(data.len() as u16).wrapping_add(4).to_be_bytes());
++            out.extend_from_slice(&fnv1a32(data).to_be_bytes());
++            out.extend_from_slice(data);
++            if let Some(cfb) = &mut self.cfb {
++                cfb.encrypt(&mut out[from..]);
++            }
++            return Ok(());
++        }
++
++        let ct_len = data.len()
++            + if self.body.is_some() {
++                CIPHER_OVERHEAD
++            } else {
++                0
++            };
++        let mut pad_len: u16 = 0;
++        if self.global_padding
++            && let Some(shake) = &mut self.shake
++        {
++            pad_len = shake.next_u16() % MAX_PADDING;
++        }
++
++        out.reserve(2 + CIPHER_OVERHEAD + ct_len + usize::from(pad_len));
++        if self.authenticated_length {
++            let stored = (ct_len as u16)
++                .wrapping_add(pad_len)
++                .wrapping_sub(CIPHER_OVERHEAD as u16);
++            // the two length bytes go straight into the frame and are sealed
++            // where they lie — no per-chunk Vec for the block
++            let from = out.len();
++            out.extend_from_slice(&stored.to_be_bytes());
++            if let Some(auth) = &self.auth {
++                auth.seal_from(self.auth_count, &self.auth_iv, out, from)?;
++                self.auth_count = self.auth_count.wrapping_add(1);
++            }
++        } else {
++            let mut len16 = (ct_len as u16).wrapping_add(pad_len);
++            if self.chunk_masking
++                && let Some(shake) = &mut self.shake
++            {
++                len16 ^= shake.next_u16();
++            }
++            out.extend_from_slice(&len16.to_be_bytes());
++        }
++        let from = out.len();
++        out.extend_from_slice(data);
++        if let Some(body) = &self.body {
++            body.seal_from(self.body_count, &self.body_iv, out, from)?;
++        }
++        self.body_count = self.body_count.wrapping_add(1);
++        if pad_len > 0 {
++            let at = out.len();
++            out.resize(at + usize::from(pad_len), 0);
++            // Not the SHAKE stream: the reference skips padding without ever
++            // pulling it out of the shared keystream, so feeding padding from
++            // `shake` desyncs the chunk masking from the second frame on.
++            random_bytes(&mut out[at..])?;
++        }
++        Ok(())
++    }
++}
++
++/// Download frame parser mirroring `StreamChunkReader` / `AEADChunkReader`
++/// plus the body AEAD layer (or the legacy CFB + checksum variant). A zero
++/// data length is the end of stream; a clean EOF at a frame boundary also
++/// ends the stream (servers close TCP).
++pub(crate) struct FrameAssembler {
++    body: Option<BodyAead>,
++    body_iv: [u8; 16],
++    body_count: u16,
++    auth: Option<BodyAead>,
++    auth_iv: [u8; 16],
++    auth_count: u16,
++    shake: Option<Shake>,
++    global_padding: bool,
++    chunk_masking: bool,
++    authenticated_length: bool,
++    /// Legacy body: continuing CFB decrypt stream (response header stream for
++    /// legacy headers, fresh response-key stream for AEAD headers).
++    cfb: Option<CfbDecrypt>,
++    checksum: bool,
++    state: AssembleState,
++    /// The frame being assembled, and how much of it has been handed to the
++    /// caller. One buffer for the whole connection: the length block, the sealed
++    /// chunk and the length block of the next chunk all land here, and the chunk
++    /// is opened where it lies. The old assembler kept a separate read-ahead
++    /// buffer, a fresh `Vec` per chunk and another one per length block, and
++    /// copied the payload out of the read-ahead before opening it -- four
++    /// allocations and a full copy of every byte, per chunk, per direction.
++    frame: Vec<u8>,
++    /// the first byte of `frame` the framing has not consumed yet
++    start: usize,
++    /// the opened payload is `frame[pos..end]`, while the state is `Frame`
++    pos: usize,
++    end: usize,
++    /// where the next record starts: past the tag and the padding, which the
++    /// payload range stops short of
++    next: usize,
++}
++
++enum AssembleState {
++    /// Collecting the length block (2 raw bytes or 18 auth-len bytes) at the
++    /// front of `frame`.
++    Len,
++    /// `frame` owes `total` sealed bytes after the length block, `pad` of them
++    /// padding.
++    Data {
++        total: usize,
++        pad: usize,
++    },
++    /// A whole chunk is assembled and opened at `frame[pos..]`, waiting for the
++    /// caller to take it.
++    Frame,
++    Eof,
++}
++
++impl FrameAssembler {
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn new(
++        security: u8,
++        request_key: &[u8; 16],
++        request_iv: &[u8; 16],
++        response_key: &[u8; 16],
++        response_iv: &[u8; 16],
++        global_padding: bool,
++        chunk_masking: bool,
++        authenticated_length: bool,
++        cfb: Option<CfbDecrypt>,
++    ) -> Self {
++        let legacy = security == super::SEC_LEGACY;
++        Self {
++            body: has_aead(security).then(|| BodyAead::new(security, response_key)),
++            body_iv: *response_iv,
++            body_count: 0,
++            auth: (!legacy && authenticated_length)
++                .then(|| BodyAead::auth_len(security, request_key)),
++            auth_iv: *request_iv,
++            auth_count: 0,
++            shake: (!legacy && (global_padding || chunk_masking)).then(|| Shake::new(response_iv)),
++            global_padding: !legacy && global_padding,
++            chunk_masking: !legacy && chunk_masking,
++            authenticated_length: !legacy && authenticated_length,
++            cfb,
++            checksum: legacy,
++            state: AssembleState::Len,
++            frame: Vec::new(),
++            start: 0,
++            pos: 0,
++            end: 0,
++            next: 0,
++        }
++    }
++
++    pub(crate) fn poll_read(
++        &mut self,
++        inner: &mut AnyStream,
++        cx: &mut Context<'_>,
++        out: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        // `filled` at entry is not zero for every caller: tokio's `read_to_end`
++        // hands over one ReadBuf with everything read so far already in it and
++        // counts this call's bytes as the delta, zero meaning end of stream.
++        // So "did I put bytes in" is a delta, not emptiness.
++        let had = out.filled().len();
++        loop {
++            // a whole chunk is sitting in `frame`, opened: hand out as much of it
++            // as the caller's buffer takes, then keep taking while the buffer has
++            // room -- one record per call meant a framing pass and a wake-up per
++            // 15 KB, the same bill that broke the ss2022 cells
++            if matches!(self.state, AssembleState::Frame) && self.pos < self.end {
++                let n = out.remaining().min(self.end - self.pos);
++                out.put_slice(&self.frame[self.pos..self.pos + n]);
++                self.pos += n;
++                if out.remaining() == 0 {
++                    return Poll::Ready(Ok(()));
++                }
++                continue;
++            }
++            let Self {
++                body,
++                body_iv,
++                body_count,
++                auth,
++                auth_iv,
++                auth_count,
++                shake,
++                global_padding,
++                chunk_masking,
++                authenticated_length,
++                cfb,
++                checksum,
++                state,
++                frame,
++                start,
++                pos,
++                end,
++                next,
++            } = self;
++            let len_block = if *authenticated_length {
++                2 + CIPHER_OVERHEAD
++            } else {
++                2
++            };
++            match std::mem::replace(state, AssembleState::Eof) {
++                // the chunk is out of the caller's hands. Whatever the read brought
++                // in behind it stays where it is: the next length block is already
++                // sitting at `end`, and moving that to the front is a copy of the
++                // rest of the stream on every single chunk.
++                AssembleState::Frame => {
++                    *start = *next;
++                    *pos = 0;
++                    *end = 0;
++                    *state = AssembleState::Len;
++                }
++                AssembleState::Eof => return Poll::Ready(Ok(())),
++                AssembleState::Len => {
++                    match fill(inner, cx, frame, start, len_block) {
++                        Poll::Ready(Ok(true)) => {}
++                        // a clean EOF at a frame boundary is how a vmess stream ends
++                        Poll::Ready(Ok(false)) => continue,
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => {
++                            *state = AssembleState::Len;
++                            // bytes from earlier records are already in the
++                            // caller's buffer: hand them over now, a `Pending`
++                            // with data in hand would strand them
++                            if out.filled().len() > had {
++                                return Poll::Ready(Ok(()));
++                            }
++                            return Poll::Pending;
++                        }
++                    }
++                    let at = *start;
++                    // the length block is opened where it lies; the read-ahead
++                    // behind it is not touched
++                    if let Some(cfb) = cfb {
++                        cfb.decrypt(&mut frame[at..at + len_block]);
++                    }
++                    let mut length = if *authenticated_length {
++                        if let Some(auth) = auth {
++                            auth.open(*auth_count, auth_iv, &mut frame[at..at + len_block])?;
++                            *auth_count = auth_count.wrapping_add(1);
++                        }
++                        u16::from_be_bytes([frame[at], frame[at + 1]])
++                            .wrapping_add(CIPHER_OVERHEAD as u16)
++                    } else {
++                        u16::from_be_bytes([frame[at], frame[at + 1]])
++                    };
++                    let mut pad = 0usize;
++                    if *global_padding && let Some(shake) = shake {
++                        pad = usize::from(shake.next_u16() % MAX_PADDING);
++                    }
++                    if *chunk_masking
++                        && !*authenticated_length
++                        && let Some(shake) = shake
++                    {
++                        length ^= shake.next_u16();
++                    }
++                    match usize::from(length).checked_sub(pad) {
++                        Some(0) => {
++                            *state = AssembleState::Eof;
++                        }
++                        Some(_) => {
++                            *state = AssembleState::Data {
++                                total: usize::from(length),
++                                pad,
++                            };
++                        }
++                        None => {
++                            return Poll::Ready(Err(io::Error::other(
++                                "bad length chunk: length below padding",
++                            )));
++                        }
++                    }
++                }
++                AssembleState::Data { total, pad } => {
++                    match fill(inner, cx, frame, start, len_block + total) {
++                        Poll::Ready(Ok(true)) => {}
++                        Poll::Ready(Ok(false)) => {
++                            return Poll::Ready(Err(io::Error::new(
++                                io::ErrorKind::UnexpectedEof,
++                                "stream closed mid-chunk",
++                            )));
++                        }
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => {
++                            *state = AssembleState::Data { total, pad };
++                            if out.filled().len() > had {
++                                return Poll::Ready(Ok(()));
++                            }
++                            return Poll::Pending;
++                        }
++                    }
++                    let Some(ct_len) = total.checked_sub(pad) else {
++                        return Poll::Ready(Err(io::Error::other(
++                            "bad chunk: length below padding",
++                        )));
++                    };
++                    let head = *start;
++                    if let Some(cfb) = cfb {
++                        cfb.decrypt(&mut frame[head + len_block..head + len_block + total]);
++                    }
++                    // the payload starts after the length block, and after the
++                    // checksum when the legacy variant carries one
++                    let mut plain_at = head + len_block;
++                    let mut plain_len = ct_len;
++                    if *checksum {
++                        if ct_len < 4 {
++                            return Poll::Ready(Err(io::Error::other("checksum chunk too short")));
++                        }
++                        let expected = u32::from_be_bytes([
++                            frame[plain_at],
++                            frame[plain_at + 1],
++                            frame[plain_at + 2],
++                            frame[plain_at + 3],
++                        ]);
++                        if fnv1a32(&frame[plain_at + 4..head + len_block + total]) != expected {
++                            return Poll::Ready(Err(io::Error::other(
++                                "vmess: invalid chunk checksum",
++                            )));
++                        }
++                        plain_at += 4;
++                        plain_len -= 4;
++                    }
++                    if let Some(body) = body {
++                        // the tag sits right after the ciphertext and before the
++                        // padding, so the sealed block is exactly `ct_len` long
++                        plain_len = body
++                            .open(
++                                *body_count,
++                                body_iv,
++                                &mut frame[plain_at..plain_at + ct_len],
++                            )
++                            .map_err(|e| io::Error::other(format!("body-chunk: {e}")))?;
++                    }
++                    *body_count = body_count.wrapping_add(1);
++                    *pos = plain_at;
++                    *end = plain_at + plain_len;
++                    *next = head + len_block + total;
++                    *state = AssembleState::Frame;
++                }
++            }
++        }
++    }
++}
++
++/// Make `frame[*at..]` hold `need` bytes, reading into the free space behind it.
++///
++/// The tail is left where it is: a vmess stream is a chain of frames, so the bytes
++/// behind the one being opened are the next frame, and moving them to the front on
++/// every chunk would be a copy of the rest of the stream. Compaction happens only
++/// when the buffer is full, and it is what gives the consumed prefix back.
++///
++/// Growth is the last resort and it is bounded. Growing on every short read, the
++/// way this used to, meant `Vec::reserve` rounding up to twice the capacity each
++/// time the read-ahead ran out ahead of the consumed prefix: a connection that
++/// carried a gigabyte ended up with a buffer to match, and every step of that was
++/// a realloc, a copy and a fresh run of pages to fault in. Sizing it once, to what
++/// the read needs and never past [`FRAME_ROOM`], is the whole difference between a
++/// 96 KiB buffer and the 681 MiB the same path used to report.
++///
++/// Returns `Ok(false)` on a clean EOF with nothing buffered, which is how a vmess
++/// stream ends; a short tail is an error.
++fn fill(
++    inner: &mut AnyStream,
++    cx: &mut Context<'_>,
++    frame: &mut Vec<u8>,
++    at: &mut usize,
++    need: usize,
++) -> Poll<io::Result<bool>> {
++    while frame.len() - *at < need {
++        if *at == frame.len() {
++            // everything buffered has been consumed: start over, nothing to move
++            frame.clear();
++            *at = 0;
++        }
++        let needed = need - (frame.len() - *at);
++        if frame.capacity().saturating_sub(frame.len()) < needed {
++            if *at > 0 {
++                let len = frame.len();
++                frame.copy_within(*at..len, 0);
++                frame.truncate(len - *at);
++                *at = 0;
++            }
++            let want = need.saturating_add(READ_CHUNK).min(FRAME_ROOM).max(need);
++            if frame.capacity() < want {
++                frame.reserve_exact(want - frame.len());
++            }
++        }
++        let len = frame.len();
++        let got = {
++            let mut buf = ReadBuf::uninit(frame.spare_capacity_mut());
++            match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut buf) {
++                Poll::Ready(Ok(())) => buf.filled().len(),
++                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                Poll::Pending => return Poll::Pending,
++            }
++        };
++        if got == 0 {
++            return if *at == frame.len() {
++                // a clean EOF at a frame boundary is how a vmess stream ends
++                Poll::Ready(Ok(false))
++            } else {
++                Poll::Ready(Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "stream closed mid-frame",
++                )))
++            };
++        }
++        // SAFETY: `got` bytes past `len` were just initialised by the read above,
++        // inside the buffer `spare_capacity_mut` pointed at
++        unsafe { frame.set_len(len + got) };
++    }
++    Poll::Ready(Ok(true))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::task::Waker;
++    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
++
++    fn key16(seed: u8) -> [u8; 16] {
++        [seed; 16]
++    }
++
++    /// The assembler behind a real `AsyncRead`, so a test can read it to the end
++    /// instead of driving the poll loop by hand.
++    struct Assembled {
++        reader: FrameAssembler,
++        inner: AnyStream,
++    }
++
++    impl AsyncRead for Assembled {
++        fn poll_read(
++            self: std::pin::Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            out: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<()>> {
++            let this = self.get_mut();
++            this.reader.poll_read(&mut this.inner, cx, out)
++        }
++    }
++
++    /// Frames from a writer that shares the assembler's keys, fed in through a
++    /// socket-shaped stream cut up by `how`.
++    async fn round_trip(
++        security: u8,
++        authenticated_length: bool,
++        rounds: usize,
++        chunk: usize,
++    ) -> Vec<u8> {
++        let mut writer = BodyWriter::new(
++            security,
++            &key16(1),
++            &key16(2),
++            /* global_padding */ false,
++            /* chunk_masking */ false,
++            authenticated_length,
++        );
++        let mut wire = Vec::new();
++        for round in 0..rounds {
++            writer
++                .frame_into(&vec![round as u8; 1000], &mut wire)
++                .expect("frame");
++        }
++        let (client, mut server) = tokio::io::duplex(1 << 20);
++        let size = if chunk == 0 { wire.len().max(1) } else { chunk };
++        let feed = async move {
++            for piece in wire.chunks(size) {
++                server.write_all(piece).await.expect("feed");
++            }
++            server.shutdown().await.expect("shutdown");
++        };
++        let mut stream = Assembled {
++            // one key pair stands in for both directions: the framing does not
++            // care which is which, only that the two halves agree -- and the real
++            // client and server do not, the body uses the response key while an
++            // authenticated length block uses the request key
++            reader: FrameAssembler::new(
++                security,
++                &key16(1),
++                &key16(2),
++                &key16(1),
++                &key16(2),
++                false,
++                false,
++                authenticated_length,
++                /* cfb */ None,
++            ),
++            inner: Box::new(client),
++        };
++        let read = async {
++            let mut out = Vec::new();
++            tokio::time::timeout(
++                std::time::Duration::from_secs(10),
++                stream.read_to_end(&mut out),
++            )
++            .await
++            .expect("no hang")
++            .expect("read through the framing");
++            out
++        };
++        let (_, out) = tokio::join!(feed, read);
++        for round in 0..rounds {
++            let at = round * 1000;
++            assert!(
++                out[at..at + 1000].iter().all(|byte| *byte == round as u8),
++                "round {round} came back wrong"
++            );
++        }
++        out
++    }
++
++    /// A clean EOF on a frame boundary ends the stream. It used to be reported as
++    /// "the length block has arrived", and the assembler then read a length out of
++    /// an empty buffer and took the process down with it.
++    #[tokio::test]
++    async fn a_clean_eof_at_a_frame_boundary_ends_the_stream() {
++        let out = round_trip(super::super::SEC_AES128_GCM, false, 3, 0).await;
++        assert_eq!(out.len(), 3000);
++    }
++
++    /// The same stream, cut up the way a socket cuts it. The read-ahead must not
++    /// lose a chunk, whatever the split is.
++    #[tokio::test]
++    async fn frames_survive_any_split_of_the_stream() {
++        for chunk in [1usize, 2, 3, 17, 999, 1000, 1001, 1018, 4096] {
++            let out = round_trip(super::super::SEC_AES128_GCM, false, 4, chunk).await;
++            assert_eq!(out.len(), 4000, "chunk size {chunk}: bytes went missing");
++        }
++    }
++
++    /// The variant with an authenticated length block: an 18-byte block at the
++    /// front of a buffer that already holds the chunk behind it. Opening it must
++    /// not truncate the read-away.
++    #[tokio::test]
++    async fn the_authenticated_length_variant_reads_whole_frames() {
++        for chunk in [1usize, 19, 1018, 4096] {
++            let out = round_trip(super::super::SEC_AES128_GCM, true, 4, chunk).await;
++            assert_eq!(out.len(), 4000, "chunk size {chunk}: bytes went missing");
++        }
++    }
++
++    /// The other body cipher, for the same reason.
++    #[tokio::test]
++    async fn the_chacha_body_reads_whole_frames() {
++        let out = round_trip(super::super::SEC_CHACHA20_POLY1305, false, 4, 1000).await;
++        assert_eq!(out.len(), 4000);
++    }
++
++    /// Every length variant of a frame must still encode its own `u16`, at the
++    /// worst padding the writer can draw.
++    #[test]
++    fn the_write_chunk_fits_the_u16_length_field() {
++        let pad = MAX_PADDING as usize - 1;
++        // the plain length carries ciphertext, its tag and the padding
++        assert!(WRITE_CHUNK + CIPHER_OVERHEAD + pad <= u16::MAX as usize);
++        // the authenticated length carries plaintext and padding
++        assert!(WRITE_CHUNK + pad <= u16::MAX as usize);
++        // the legacy length carries the payload and its checksum
++        assert!(WRITE_CHUNK + 4 <= u16::MAX as usize);
++    }
++
++    /// A frame of the maximum size, through the whole path, in both length
++    /// variants: the bound is only worth as much as the round trip that proves
++    /// the writer never wraps it.
++    #[tokio::test]
++    async fn the_largest_chunk_round_trips() {
++        for authenticated_length in [false, true] {
++            let mut writer = BodyWriter::new(
++                super::super::SEC_AES128_GCM,
++                &key16(1),
++                &key16(2),
++                /* global_padding */ false,
++                /* chunk_masking */ false,
++                authenticated_length,
++            );
++            let mut wire = Vec::new();
++            writer
++                .frame_into(&vec![0xA5; WRITE_CHUNK], &mut wire)
++                .expect("frame");
++            let (client, mut server) = tokio::io::duplex(1 << 20);
++            let feed = async move {
++                server.write_all(&wire).await.expect("feed");
++                server.shutdown().await.expect("shutdown");
++            };
++            let mut stream = Assembled {
++                reader: FrameAssembler::new(
++                    super::super::SEC_AES128_GCM,
++                    &key16(1),
++                    &key16(2),
++                    &key16(1),
++                    &key16(2),
++                    false,
++                    false,
++                    authenticated_length,
++                    /* cfb */ None,
++                ),
++                inner: Box::new(client),
++            };
++            let read = async {
++                let mut out = Vec::new();
++                tokio::time::timeout(
++                    std::time::Duration::from_secs(10),
++                    stream.read_to_end(&mut out),
++                )
++                .await
++                .expect("no hang")
++                .expect("read the largest chunk");
++                out
++            };
++            let (_, out) = tokio::join!(feed, read);
++            assert_eq!(out.len(), WRITE_CHUNK, "auth_len={authenticated_length}");
++            assert!(
++                out.iter().all(|byte| *byte == 0xA5),
++                "auth_len={authenticated_length}: payload came back wrong"
++            );
++        }
++    }
++
++    /// Several records that are already in the socket come back from one
++    /// `poll_read`: one record per call was a framing pass and a wake-up per
++    /// record on the download side.
++    #[tokio::test]
++    async fn one_read_drains_every_record_that_is_ready() {
++        let (mut writer, mut reader) = pool(super::super::SEC_AES128_GCM);
++        let mut wire = Vec::new();
++        for round in 0..4u8 {
++            writer
++                .frame_into(&vec![round; 1000], &mut wire)
++                .expect("frame");
++        }
++        let (client, mut server) = tokio::io::duplex(1 << 20);
++        server.write_all(&wire).await.expect("feed");
++        let mut inner: AnyStream = Box::new(client);
++        let mut scratch = vec![0u8; 8 * 1024];
++        let mut cx = Context::from_waker(Waker::noop());
++        let mut buf = ReadBuf::new(&mut scratch);
++        match reader.poll_read(&mut inner, &mut cx, &mut buf) {
++            Poll::Ready(Ok(())) => assert_eq!(
++                buf.filled().len(),
++                4000,
++                "all four records were in the socket, one call must drain them"
++            ),
++            Poll::Ready(Err(err)) => panic!("read failed: {err}"),
++            Poll::Pending => panic!("the records are already in the socket"),
++        }
++    }
++
++    /// The frame buffer must not follow the stream. It used to be grown with
++    /// `Vec::reserve` every time the read-ahead ran out ahead of the consumed
++    /// prefix, and `reserve` rounds up to twice the capacity -- so a connection
++    /// that carried a lot ended up with a buffer to match. A hundred megabytes
++    /// through the assembler is what it takes to see it: the peak the benchmark
++    /// reported for this path was 681 MiB.
++    #[tokio::test(flavor = "current_thread")]
++    async fn the_frame_buffer_does_not_follow_the_stream() {
++        let (mut writer, mut reader) = pool(super::super::SEC_AES128_GCM);
++        let (client, mut server) = tokio::io::duplex(1 << 20);
++        // ~100 MiB of payload in 15 KB chunks
++        let rounds = 7000usize;
++        let feed = async move {
++            let mut wire: Vec<u8> = Vec::new();
++            for round in 0..rounds {
++                writer
++                    .frame_into(&vec![round as u8; 15000], &mut wire)
++                    .expect("frame");
++                if wire.len() >= 1 << 20 {
++                    server.write_all(&wire).await.expect("feed");
++                    wire.clear();
++                }
++            }
++            server.write_all(&wire).await.expect("feed");
++            server.shutdown().await.expect("shutdown");
++        };
++        let read = async {
++            let mut inner: AnyStream = Box::new(client);
++            let mut peak = 0usize;
++            let mut scratch = vec![0u8; 64 * 1024];
++            loop {
++                let mut cx = Context::from_waker(Waker::noop());
++                let mut buf = ReadBuf::new(&mut scratch);
++                match reader.poll_read(&mut inner, &mut cx, &mut buf) {
++                    Poll::Ready(Ok(())) => {
++                        if buf.filled().is_empty() {
++                            break;
++                        }
++                        peak = peak.max(reader.frame.capacity());
++                    }
++                    Poll::Ready(Err(err)) => panic!("read failed: {err}"),
++                    // the feeder has not written its first megabyte yet
++                    Poll::Pending => tokio::task::yield_now().await,
++                }
++            }
++            peak
++        };
++        let (_, peak) = tokio::join!(feed, read);
++        assert!(
++            peak <= FRAME_ROOM,
++            "the frame buffer grew to {peak} bytes over {rounds} frames,              the ceiling is {FRAME_ROOM}"
++        );
++    }
++
++    /// One set of keys for both halves: the framing does not care which is which.
++    fn pool(security: u8) -> (BodyWriter, FrameAssembler) {
++        let writer = BodyWriter::new(security, &key16(1), &key16(2), false, false, false);
++        let reader = FrameAssembler::new(
++            security,
++            &key16(1),
++            &key16(2),
++            &key16(1),
++            &key16(2),
++            false,
++            false,
++            false,
++            None,
++        );
++        (writer, reader)
++    }
++
++    /// A flipped byte anywhere in a frame has to be caught, not passed on.
++    #[tokio::test]
++    async fn a_corrupted_frame_is_refused() {
++        let mut writer = BodyWriter::new(
++            super::super::SEC_AES128_GCM,
++            &key16(1),
++            &key16(2),
++            false,
++            false,
++            false,
++        );
++        let mut wire = Vec::new();
++        writer.frame_into(&[7u8; 1000], &mut wire).expect("frame");
++        let at = wire.len() / 2;
++        wire[at] ^= 0x01;
++        let (client, mut server) = tokio::io::duplex(1 << 20);
++        let feed = async move {
++            let _ = server.write_all(&wire).await;
++        };
++        let mut stream = Assembled {
++            reader: FrameAssembler::new(
++                super::super::SEC_AES128_GCM,
++                &key16(1),
++                &key16(2),
++                &key16(1),
++                &key16(2),
++                false,
++                false,
++                false,
++                None,
++            ),
++            inner: Box::new(client),
++        };
++        let read = async {
++            let mut out = Vec::new();
++            stream.read_to_end(&mut out).await
++        };
++        let (_, result) = tokio::join!(feed, read);
++        assert!(result.is_err(), "a mangled frame must not pass as payload");
++    }
++}
+diff --git a/crates/core-runtime/src/outbound/vmess/kdf.rs b/crates/core-runtime/src/outbound/vmess/kdf.rs
+new file mode 100644
+index 0000000..fcd43e2
+--- /dev/null
++++ b/crates/core-runtime/src/outbound/vmess/kdf.rs
+@@ -0,0 +1,221 @@
++//! VMess key derivation: nested HMAC-SHA256 KDF (sing-vmess `kdf.go`),
++//! command keys, UUID parsing with v5 fallback, and small hash helpers.
++
++use md5::Md5;
++use sha1::Sha1;
++use sha2::{Digest, Sha256};
++
++/// Mirrors Go's `hMacCreator` chain: each level is HMAC keyed by its value
++/// using the parent level as the hash function; the innermost is
++/// HMAC-SHA256 keyed with `KDFSaltConstVMessAEADKDF`.
++enum KdfHash {
++    Sha256,
++    Hmac { key: Vec<u8>, parent: Box<KdfHash> },
++}
++
++impl KdfHash {
++    const BLOCK: usize = 64;
++
++    fn hash(&self, data: &[u8]) -> [u8; 32] {
++        match self {
++            KdfHash::Sha256 => Sha256::digest(data).into(),
++            KdfHash::Hmac { key, parent } => {
++                let mut k = key.clone();
++                if k.len() > Self::BLOCK {
++                    k = parent.hash(&k).to_vec();
++                }
++                k.resize(Self::BLOCK, 0);
++                let mut ipad = [0x36u8; Self::BLOCK];
++                let mut opad = [0x5cu8; Self::BLOCK];
++                for (i, byte) in k.iter().enumerate() {
++                    ipad[i] ^= byte;
++                    opad[i] ^= byte;
++                }
++                let mut inner = ipad.to_vec();
++                inner.extend_from_slice(data);
++                let inner = parent.hash(&inner);
++                let mut outer = opad.to_vec();
++                outer.extend_from_slice(&inner);
++                parent.hash(&outer)
++            }
++        }
++    }
++}
++
++/// sing-vmess `KDF(key, salt, path...)`: chain root + salt + path elements.
++pub(crate) fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
++    let mut level = KdfHash::Hmac {
++        key: b"VMess AEAD KDF".to_vec(),
++        parent: Box::new(KdfHash::Sha256),
++    };
++    for elem in path {
++        level = KdfHash::Hmac {
++            key: elem.to_vec(),
++            parent: Box::new(level),
++        };
++    }
++    level.hash(key)
++}
++
++pub(crate) fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
++    let full = kdf(key, path);
++    full[..16].try_into().expect("kdf output is 32 bytes")
++}
++
++/// `Key(user)`: MD5(uuid || "c48619fe-...").
++pub(crate) fn cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
++    let mut hash = Md5::new();
++    hash.update(uuid);
++    hash.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
++    hash.finalize().into()
++}
++
++/// `GenerateChacha20Poly1305Key`: 32 bytes = MD5(k) || MD5(MD5(k)).
++pub(crate) fn chacha_key(key16: &[u8; 16]) -> [u8; 32] {
++    let first = Md5::digest(key16);
++    let second = Md5::digest(first);
++    let mut out = [0u8; 32];
++    out[..16].copy_from_slice(&first);
++    out[16..].copy_from_slice(&second);
++    out
++}
++
++pub(crate) fn fnv1a32(data: &[u8]) -> u32 {
++    let mut hash: u32 = 0x811C_9DC5;
++    for &byte in data {
++        hash ^= u32::from(byte);
++        hash = hash.wrapping_mul(0x0100_0193);
++    }
++    hash
++}
++
++pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
++    let mut crc: u32 = !0;
++    for &byte in data {
++        crc ^= u32::from(byte);
++        for _ in 0..8 {
++            if crc & 1 != 0 {
++                crc = (crc >> 1) ^ 0xEDB8_8320;
++            } else {
++                crc >>= 1;
++            }
++        }
++    }
++    !crc
++}
++
++/// `AlterId(user)`: MD5 chain seeded with user || salt; practically the
++/// first round always differs from the original uuid.
++pub(crate) fn alter_key(uuid: &[u8; 16]) -> [u8; 16] {
++    let mut hash = Md5::new();
++    hash.update(uuid);
++    hash.update(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
++    let mut candidate: [u8; 16] = hash.clone().finalize().into();
++    if candidate == *uuid {
++        hash.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
++        candidate = hash.clone().finalize().into();
++        while candidate == *uuid {
++            hash.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
++            candidate = hash.clone().finalize().into();
++        }
++    }
++    candidate
++}
++
++/// Canonical hyphenated UUIDs parse directly; anything else becomes
++/// `uuid.NewV5(uuid.Nil, raw)` (SHA1 of NIL || name with version/variant bits).
++pub(crate) fn parse_uuid(raw: &str) -> Result<[u8; 16], std::io::Error> {
++    let bytes = raw.as_bytes();
++    let canonical = bytes.len() == 36
++        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
++        && bytes[9..13].iter().all(u8::is_ascii_hexdigit)
++        && bytes[14..18].iter().all(u8::is_ascii_hexdigit)
++        && bytes[19..23].iter().all(u8::is_ascii_hexdigit)
++        && bytes[24..36].iter().all(u8::is_ascii_hexdigit)
++        && bytes[8] == b'-'
++        && bytes[13] == b'-'
++        && bytes[18] == b'-'
++        && bytes[23] == b'-';
++    if canonical {
++        let hex: String = raw.chars().filter(|c| *c != '-').collect();
++        let mut uuid = [0u8; 16];
++        for (i, byte) in uuid.iter_mut().enumerate() {
++            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
++                .map_err(|_| std::io::Error::other("invalid uuid"))?;
++        }
++        return Ok(uuid);
++    }
++    let mut hash = Sha1::new();
++    hash.update([0u8; 16]);
++    hash.update(raw.as_bytes());
++    let sum = hash.finalize();
++    let mut uuid: [u8; 16] = sum[..16].try_into().expect("sha1 output is 20 bytes");
++    uuid[6] = (uuid[6] & 0x0f) | 0x50;
++    uuid[8] = (uuid[8] & 0x3f) | 0x80;
++    Ok(uuid)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn kdf_matches_reference_vector() {
++        let out = kdf(
++            b"Demo Key for KDF Value Test",
++            &[
++                b"Demo Path for KDF Value Test",
++                b"Demo Path for KDF Value Test2",
++                b"Demo Path for KDF Value Test3",
++            ],
++        );
++        assert_eq!(
++            out,
++            [
++                0x53, 0xe9, 0xd7, 0xe1, 0xbd, 0x7b, 0xd2, 0x50, 0x22, 0xb7, 0x1e, 0xad, 0x07, 0xd8,
++                0xa5, 0x96, 0xef, 0xc8, 0xa8, 0x45, 0xc7, 0x88, 0x86, 0x52, 0xfd, 0x68, 0x4b, 0x49,
++                0x03, 0xdc, 0x88, 0x92
++            ]
++        );
++    }
++
++    #[test]
++    fn kdf16_is_prefix_of_kdf() {
++        let key = [7u8; 16];
++        assert_eq!(
++            kdf16(&key, &[b"salt", b"path"]),
++            kdf(&key, &[b"salt", b"path"])[..16]
++        );
++    }
++
++    #[test]
++    fn cmd_key_matches_manual_derivation() {
++        let uuid = parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").expect("parse");
++        let mut hash = Md5::new();
++        hash.update(uuid);
++        hash.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
++        let expected: [u8; 16] = hash.finalize().into();
++        assert_eq!(cmd_key(&uuid), expected);
++    }
++
++    #[test]
++    fn fnv1a_known_vectors() {
++        assert_eq!(fnv1a32(b""), 0x811C_9DC5);
++        assert_eq!(fnv1a32(b"a"), 0xE40C_292C);
++    }
++
++    #[test]
++    fn crc32_known_vector() {
++        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
++    }
++
++    #[test]
++    fn uuid_v5_sets_version_and_variant() {
++        let a = parse_uuid("not a uuid").expect("v5 fallback");
++        let b = parse_uuid("not a uuid").expect("v5 fallback");
++        assert_eq!(a, b, "v5 must be deterministic");
++        assert_eq!(a[6] >> 4, 0x5);
++        assert_eq!(a[8] >> 6, 0b10);
++        assert_ne!(a, parse_uuid("another uuid").unwrap());
++    }
++}
+diff --git a/crates/core-runtime/src/outbound/vmess/mod.rs b/crates/core-runtime/src/outbound/vmess/mod.rs
+new file mode 100644
+index 0000000..7dee09c
+--- /dev/null
++++ b/crates/core-runtime/src/outbound/vmess/mod.rs
+@@ -0,0 +1,607 @@
++//! vmess outbound: AEAD request header (alterId == 0) with AES-128-GCM,
++//! chacha20-poly1305, or no body encryption, plus optional chunk masking,
++//! global padding, and authenticated length. Legacy CFB headers, transports,
++//! and UDP packet commands are not implemented yet.
++
++pub(crate) mod framing;
++pub(crate) mod kdf;
++pub(crate) mod wire;
++
++use std::io;
++use std::pin::Pin;
++use std::sync::Arc;
++use std::task::{Context, Poll, ready};
++
++use cfb_mode::cipher::KeyIvInit;
++use serde_json::Value;
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
++
++use crate::inbound::{AnyStream, Target};
++use crate::outbound::mux;
++use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
++use crate::outbound::proxy::server_endpoint;
++use crate::util::random_bytes;
++use crate::outbound::transport::Transport;
++use crate::outbound::vmess::framing::{
++    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK, write_batch,
++};
++use crate::outbound::vmess::wire::{
++    derive_response_keys, legacy_header_hash, legacy_response_keys, legacy_time_iv,
++    response_header_keys, seal_request_header, unix_now,
++};
++use crate::tls_client::TlsOptions;
++
++pub(crate) const SEC_LEGACY: u8 = 1;
++pub(crate) const SEC_AES128_GCM: u8 = 3;
++pub(crate) const SEC_CHACHA20_POLY1305: u8 = 4;
++pub(crate) const SEC_NONE: u8 = 5;
++
++const OPT_CHUNK_STREAM: u8 = 0x01;
++const OPT_CHUNK_MASKING: u8 = 0x04;
++const OPT_GLOBAL_PADDING: u8 = 0x08;
++const OPT_AUTHENTICATED_LENGTH: u8 = 0x10;
++
++#[derive(Clone)]
++pub struct Vmess {
++    server: String,
++    port: u16,
++    cmd_key: [u8; 16],
++    security: u8,
++    global_padding: bool,
++    authenticated_length: bool,
++    alter_key: Option<[u8; 16]>,
++    transport: Transport,
++    tls: Option<TlsOptions>,
++    /// how datagrams are framed on the stream, see `packet`
++    packet_encoding: PacketEncoding,
++    /// Mux.Cool session pool; `None` when multiplexing is off
++    mux: Option<Arc<mux::Client>>,
++    pub dial: crate::outbound::dial::DialOptions,
++}
++
++impl Vmess {
++    pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
++        let (server, port) = server_endpoint(obj, at)?;
++        let uuid_raw = obj
++            .get("uuid")
++            .and_then(Value::as_str)
++            .ok_or_else(|| anyhow::anyhow!("{at}: missing uuid"))?;
++        let uuid = kdf::parse_uuid(uuid_raw).map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
++        let cmd_key = kdf::cmd_key(&uuid);
++
++        let alter_id = obj.get("alter_id").and_then(Value::as_u64).unwrap_or(0);
++        let alter_key = match alter_id {
++            0 => None,
++            _ => Some(kdf::alter_key(&uuid)),
++        };
++        let multiplex = match obj.get("multiplex") {
++            Some(value) if !value.is_null() => {
++                mux::MuxOptions::parse(value, &format!("{at}.multiplex"))?
++            }
++            _ => mux::MuxOptions::default(),
++        };
++        let packet_encoding =
++            PacketEncoding::parse(obj.get("packet_encoding").and_then(Value::as_str), at)?;
++
++        let tls = TlsOptions::from_outbound(obj, &server, at)?;
++        let security = match obj
++            .get("security")
++            .and_then(Value::as_str)
++            .unwrap_or("auto")
++        {
++            // TLS has nothing to say about the vmess body. Reading it as a
++            // reason to turn the body encryption off means a config with
++            // `tls` in it carries its payload in the clear, which is exactly
++            // the sort of silent downgrade nobody notices until it matters.
++            "" | "auto" => SEC_AES128_GCM,
++            "none" | "zero" => SEC_NONE,
++            "aes-128-gcm" => SEC_AES128_GCM,
++            "chacha20-poly1305" => SEC_CHACHA20_POLY1305,
++            "aes-128-cfb" => SEC_LEGACY,
++            other => anyhow::bail!("{at}: vmess security {other:?} not supported"),
++        };
++        Ok(Self {
++            server,
++            port,
++            cmd_key,
++            security,
++            global_padding: obj
++                .get("global_padding")
++                .and_then(Value::as_bool)
++                .unwrap_or(false),
++            authenticated_length: obj
++                .get("authenticated_length")
++                .and_then(Value::as_bool)
++                .unwrap_or(false),
++            alter_key,
++            transport: Transport::parse(obj, at)?,
++            tls,
++            packet_encoding,
++            mux: if multiplex.min_streams > 0
++                || multiplex.max_connections > 0
++                || multiplex.max_streams > 0
++            {
++                Some(mux::Client::new(multiplex)?)
++            } else {
++                None
++            },
++            dial: crate::outbound::dial::DialOptions::parse(obj)?,
++        })
++    }
++
++    /// The sealed request head for `command` (1 tcp, 2 udp, 3 mux).
++    fn request(
++        &self,
++        command: u8,
++        target: &Target,
++        request_key: &[u8; 16],
++        request_iv: &[u8; 16],
++        response_header: u8,
++    ) -> io::Result<Vec<u8>> {
++        let mut option = 0u8;
++        if self.security == SEC_AES128_GCM || self.security == SEC_CHACHA20_POLY1305 {
++            option |= OPT_CHUNK_STREAM | OPT_CHUNK_MASKING;
++            if self.global_padding {
++                option |= OPT_GLOBAL_PADDING;
++            }
++            if self.authenticated_length {
++                option |= OPT_AUTHENTICATED_LENGTH;
++            }
++        } else if self.security == SEC_LEGACY {
++            option |= OPT_CHUNK_STREAM;
++        }
++
++        let header = wire::build_request_header(
++            request_iv,
++            request_key,
++            response_header,
++            option,
++            self.security,
++            command,
++            target,
++        )?;
++        if let Some(alter_key) = &self.alter_key {
++            // Legacy header: HMAC-MD5(alterKey, ts) || CFB(cmdKey, md5(ts x4)).
++            let timestamp = unix_now()?;
++            let mut request = Vec::with_capacity(16 + header.len());
++            request.extend_from_slice(&legacy_header_hash(alter_key, timestamp));
++            let mut encrypted = header;
++            let mut cfb = CfbEncrypt::new_from_slices(&self.cmd_key, &legacy_time_iv(timestamp))
++                .map_err(|_| io::Error::other("cfb init"))?;
++            cfb.encrypt(&mut encrypted);
++            request.extend_from_slice(&encrypted);
++            Ok(request)
++        } else {
++            seal_request_header(&self.cmd_key, &header)
++        }
++    }
++
++    /// A datagram relay. vmess packets ride the raw stream after the request
++    /// head, not the body cipher, so only the response header is consumed.
++    pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
++        let mut request_key = [0u8; 16];
++        let mut request_iv = [0u8; 16];
++        let mut response_header = [0u8; 1];
++        random_bytes(&mut request_key)?;
++        random_bytes(&mut request_iv)?;
++        random_bytes(&mut response_header)?;
++        let mode = self.packet_encoding;
++        let first = self.request(
++            mode.command(),
++            &mode.request_target(target),
++            &request_key,
++            &request_iv,
++            response_header[0],
++        )?;
++        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
++        let mut stream = self
++            .transport
++            .connect_or_dial(
++                self.tls.as_ref(),
++                &self.server,
++                self.port,
++                &self.dial,
++            )
++            .await?;
++        stream.write_all(&first).await?;
++        // The packet path has no codec, so the server answers with the bare
++        // `[version][addonsLen]` pair rather than the sealed response header.
++        // It has to be swallowed here: the relay reads the raw stream, and a
++        // header left in it would be taken for the length of the first
++        // datagram. Both bytes are zero, which is the answer and not a refusal
++        // -- a refused request gets no answer at all, only a closed connection.
++        let mut head = [0u8; 2];
++        stream.read_exact(&mut head).await?;
++        let stream: AnyStream = Box::new(stream);
++        spawn_packet_bridge(stream, peer, mode, target.clone());
++        Ok(local)
++    }
++
++    pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
++        if let Some(mux) = &self.mux {
++            if !mux.has_dialer().await {
++                // a session is opened against the magic destination through the
++                // same request machinery a normal connection uses
++                let copy = self.clone();
++                mux.set_dialer(Arc::new(move || {
++                    let copy = copy.clone();
++                    let target = mux::mux_target();
++                    Box::pin(async move { copy.connect_direct(&target).await })
++                }))
++                .await;
++            }
++            let stream = mux.open(target).await?;
++            return Ok(Box::new(stream));
++        }
++        self.connect_direct(target).await
++    }
++
++    async fn connect_direct(&self, target: &Target) -> io::Result<AnyStream> {
++        let mut request_key = [0u8; 16];
++        let mut request_iv = [0u8; 16];
++        let mut response_header = [0u8; 1];
++        random_bytes(&mut request_key)?;
++        random_bytes(&mut request_iv)?;
++        random_bytes(&mut response_header)?;
++
++        let first = self.request(
++            CMD_TCP,
++            target,
++            &request_key,
++            &request_iv,
++            response_header[0],
++        )?;
++        // a ws transport with early data carries the request in the upgrade head
++        let mut stream = self
++            .transport
++            .connect_or_dial(
++                self.tls.as_ref(),
++                &self.server,
++                self.port,
++                &self.dial,
++            )
++            .await?;
++        stream.write_all(&first).await?;
++
++        let (response_key, response_iv) = derive_response_keys(&request_key, &request_iv);
++        let (len_key, len_nonce, hdr_key, hdr_nonce) =
++            response_header_keys(&response_key, &response_iv);
++        let legacy_resp_cfb = if self.alter_key.is_some() {
++            let (rk, riv) = legacy_response_keys(&request_key, &request_iv);
++            Some(CfbDecrypt::new_from_slices(&rk, &riv).map_err(|_| io::Error::other("cfb init"))?)
++        } else {
++            None
++        };
++        Ok(Box::new(VmessStream {
++            inner: stream,
++            security: self.security,
++            response_header: response_header[0],
++            len_key,
++            len_nonce,
++            hdr_key,
++            hdr_nonce,
++            request_key,
++            request_iv,
++            response_key,
++            response_iv,
++            global_padding: self.global_padding,
++            authenticated_length: self.authenticated_length,
++            legacy_resp_cfb,
++            read: if self.alter_key.is_some() {
++                ReadPhase::LegacyRespHeader { buf: Vec::new() }
++            } else {
++                ReadPhase::RespLen { buf: Vec::new() }
++            },
++            write: match self.security {
++                SEC_NONE => WritePhase::Raw,
++                _ => WritePhase::Framed(Box::new(WriterState {
++                    body: BodyWriter::new(
++                        self.security,
++                        &request_key,
++                        &request_iv,
++                        self.global_padding,
++                        true,
++                        self.authenticated_length,
++                    ),
++                    flushing: None,
++                    spare: Vec::new(),
++                    consumed: 0,
++                })),
++            },
++        }))
++    }
++}
++
++struct VmessStream {
++    inner: AnyStream,
++    security: u8,
++    response_header: u8,
++    len_key: [u8; 16],
++    len_nonce: [u8; 12],
++    hdr_key: [u8; 16],
++    hdr_nonce: [u8; 12],
++    request_key: [u8; 16],
++    request_iv: [u8; 16],
++    response_key: [u8; 16],
++    response_iv: [u8; 16],
++    global_padding: bool,
++    authenticated_length: bool,
++    /// CFB stream for the legacy 4-byte response header (alterId > 0);
++    /// continued into the body for the legacy security.
++    legacy_resp_cfb: Option<CfbDecrypt>,
++    read: ReadPhase,
++    write: WritePhase,
++}
++
++enum ReadPhase {
++    /// Raw passthrough (security none over TCP).
++    Raw,
++    /// AEAD response header: 18-byte encrypted length block.
++    RespLen { buf: Vec<u8> },
++    /// AEAD response header payload of `need` bytes.
++    RespPayload { buf: Vec<u8>, need: usize },
++    /// Legacy response header: 4 CFB-decrypted bytes (alterId > 0).
++    LegacyRespHeader { buf: Vec<u8> },
++    /// Body frames via the per-security assembler.
++    Body(Box<FrameAssembler>),
++}
++
++enum WritePhase {
++    Raw,
++    Framed(Box<WriterState>),
++}
++
++struct WriterState {
++    body: BodyWriter,
++    flushing: Option<(Vec<u8>, usize)>,
++    /// the frame buffer between writes. A batch is 60 KiB, so allocating one per
++    /// `poll_write` is an allocation and a cold page fault every 60 KiB of stream;
++    /// shadowsocks already keeps its buffer the same way.
++    spare: Vec<u8>,
++    consumed: usize,
++}
++
++enum HeaderStep {
++    RespLen(Vec<u8>),
++    RespPayload(Vec<u8>, usize),
++    LegacyRespHeader(Vec<u8>),
++}
++
++impl AsyncRead for VmessStream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        out: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        let this = &mut *self;
++        loop {
++            if matches!(this.read, ReadPhase::Raw) {
++                return Pin::new(&mut this.inner).poll_read(cx, out);
++            }
++            let step = match std::mem::replace(&mut this.read, ReadPhase::Raw) {
++                ReadPhase::Raw => unreachable!("raw handled above"),
++                ReadPhase::RespLen { buf } => HeaderStep::RespLen(buf),
++                ReadPhase::RespPayload { buf, need } => HeaderStep::RespPayload(buf, need),
++                ReadPhase::LegacyRespHeader { buf } => HeaderStep::LegacyRespHeader(buf),
++                ReadPhase::Body(assembler) => {
++                    this.read = ReadPhase::Body(assembler);
++                    let ReadPhase::Body(assembler) = &mut this.read else {
++                        unreachable!("just stored")
++                    };
++                    return assembler.poll_read(&mut this.inner, cx, out);
++                }
++            };
++            match step {
++                HeaderStep::RespLen(mut buf) => {
++                    match poll_fill(&mut this.inner, cx, &mut buf, 18) {
++                        Poll::Ready(Ok(true)) => {}
++                        Poll::Ready(Ok(false)) => {
++                            return Poll::Ready(Err(io::Error::other(
++                                "vmess: connection closed before response header",
++                            )));
++                        }
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => {
++                            this.read = ReadPhase::RespLen { buf };
++                            return Poll::Pending;
++                        }
++                    }
++                    wire::gcm_open(&this.len_key, &this.len_nonce, &[], &mut buf)
++                        .map_err(|e| io::Error::other(format!("resp-len: {e}")))?;
++                    let header_len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
++                    this.read = ReadPhase::RespPayload {
++                        buf: Vec::with_capacity(header_len + 16),
++                        need: header_len + 16,
++                    };
++                }
++                HeaderStep::RespPayload(mut buf, need) => {
++                    match poll_fill(&mut this.inner, cx, &mut buf, need) {
++                        Poll::Ready(Ok(true)) => {}
++                        Poll::Ready(Ok(false)) => {
++                            return Poll::Ready(Err(io::Error::other(
++                                "vmess: connection closed before response header payload",
++                            )));
++                        }
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => {
++                            this.read = ReadPhase::RespPayload { buf, need };
++                            return Poll::Pending;
++                        }
++                    }
++                    let plain = wire::gcm_open(&this.hdr_key, &this.hdr_nonce, &[], &mut buf)
++                        .map_err(|e| io::Error::other(format!("resp-payload: {e}")))?;
++                    if buf[..plain].first() != Some(&this.response_header) {
++                        return Poll::Ready(Err(io::Error::other(
++                            "vmess: unexpected response header",
++                        )));
++                    }
++                    this.read = if this.security == SEC_NONE {
++                        ReadPhase::Raw
++                    } else {
++                        // AEAD header with a legacy body: the download CFB
++                        // stream starts fresh with the sha256-derived keys.
++                        let cfb = (this.security == SEC_LEGACY).then(|| {
++                            CfbDecrypt::new_from_slices(&this.response_key, &this.response_iv)
++                                .expect("cfb key/iv length")
++                        });
++                        let assembler = FrameAssembler::new(
++                            this.security,
++                            &this.request_key,
++                            &this.request_iv,
++                            &this.response_key,
++                            &this.response_iv,
++                            this.global_padding,
++                            true,
++                            this.authenticated_length,
++                            cfb,
++                        );
++                        ReadPhase::Body(Box::new(assembler))
++                    };
++                }
++                HeaderStep::LegacyRespHeader(mut buf) => {
++                    match poll_fill(&mut this.inner, cx, &mut buf, 4) {
++                        Poll::Ready(Ok(true)) => {}
++                        Poll::Ready(Ok(false)) => {
++                            return Poll::Ready(Err(io::Error::other(
++                                "vmess: connection closed before response header",
++                            )));
++                        }
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => {
++                            this.read = ReadPhase::LegacyRespHeader { buf };
++                            return Poll::Pending;
++                        }
++                    }
++                    if let Some(cfb) = &mut this.legacy_resp_cfb {
++                        cfb.decrypt(&mut buf);
++                    }
++                    if buf.first() != Some(&this.response_header) {
++                        return Poll::Ready(Err(io::Error::other(
++                            "vmess: unexpected response header",
++                        )));
++                    }
++                    this.read = if this.security == SEC_NONE {
++                        ReadPhase::Raw
++                    } else {
++                        // Legacy headers derive response keys with MD5; the
++                        // CFB stream continues only into a legacy body.
++                        let (rk, riv) = legacy_response_keys(&this.request_key, &this.request_iv);
++                        let cfb = if this.security == SEC_LEGACY {
++                            this.legacy_resp_cfb.take()
++                        } else {
++                            None
++                        };
++                        let assembler = FrameAssembler::new(
++                            this.security,
++                            &this.request_key,
++                            &this.request_iv,
++                            &rk,
++                            &riv,
++                            this.global_padding,
++                            true,
++                            this.authenticated_length,
++                            cfb,
++                        );
++                        ReadPhase::Body(Box::new(assembler))
++                    };
++                }
++            }
++        }
++    }
++}
++
++impl AsyncWrite for VmessStream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        let this = &mut *self;
++        let WritePhase::Raw = this.write else {
++            let state = match &mut this.write {
++                WritePhase::Framed(state) => state,
++                WritePhase::Raw => unreachable!("raw handled above"),
++            };
++            loop {
++                if let Some((frame, off)) = &mut state.flushing {
++                    while *off < frame.len() {
++                        let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &frame[*off..]))?;
++                        if n == 0 {
++                            return Poll::Ready(Err(io::Error::new(
++                                io::ErrorKind::WriteZero,
++                                "vmess: frame write stalled",
++                            )));
++                        }
++                        *off += n;
++                    }
++                    if let Some((frame, _)) = state.flushing.take() {
++                        state.spare = frame;
++                    }
++                    return Poll::Ready(Ok(state.consumed));
++                }
++                if buf.is_empty() {
++                    return Poll::Ready(Ok(0));
++                }
++                // everything the caller handed over, up to one batch, leaves in
++                // one frame buffer and one write
++                let batch = buf.len().min(write_batch());
++                let mut frame = std::mem::take(&mut state.spare);
++                frame.clear();
++                let mut taken = 0;
++                while taken < batch {
++                    let take = (batch - taken).min(WRITE_CHUNK);
++                    state
++                        .body
++                        .frame_into(&buf[taken..taken + take], &mut frame)?;
++                    taken += take;
++                }
++                state.flushing = Some((frame, 0));
++                state.consumed = taken;
++            }
++        };
++        Pin::new(&mut this.inner).poll_write(cx, buf)
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.inner).poll_shutdown(cx)
++    }
++}
++
++/// Fill `buf` to `need` bytes; `Ok(false)` on clean EOF with an empty buffer.
++fn poll_fill(
++    inner: &mut AnyStream,
++    cx: &mut Context<'_>,
++    buf: &mut Vec<u8>,
++    need: usize,
++) -> Poll<io::Result<bool>> {
++    while buf.len() < need {
++        let start = buf.len();
++        buf.resize(need, 0);
++        let mut read_buf = ReadBuf::new(&mut buf[start..]);
++        match Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
++            Poll::Ready(Ok(())) => {
++                let n = read_buf.filled().len();
++                buf.truncate(start + n);
++                if n == 0 {
++                    if start == 0 {
++                        return Poll::Ready(Ok(false));
++                    }
++                    return Poll::Ready(Err(io::Error::new(
++                        io::ErrorKind::UnexpectedEof,
++                        "vmess: stream closed mid-header",
++                    )));
++                }
++            }
++            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++            Poll::Pending => {
++                buf.truncate(start);
++                return Poll::Pending;
++            }
++        }
++    }
++    Poll::Ready(Ok(true))
++}
+diff --git a/crates/core-runtime/src/outbound/vmess/wire.rs b/crates/core-runtime/src/outbound/vmess/wire.rs
+new file mode 100644
+index 0000000..84931bd
+--- /dev/null
++++ b/crates/core-runtime/src/outbound/vmess/wire.rs
+@@ -0,0 +1,239 @@
++//! VMess wire primitives: AES auth ID, request header construction and AEAD
++//! sealing (`SealVMessAEADHeader`), response header decryption.
++
++use std::io;
++
++use aes::cipher::{BlockEncrypt, KeyInit};
++use aes_gcm::aead::{Aead, AeadInPlace, Payload};
++use aes_gcm::{Aes128Gcm, Tag};
++use sha2::{Digest as _, Sha256};
++
++use crate::inbound::Target;
++use crate::util::random_bytes;
++use crate::outbound::vmess::kdf::{crc32_ieee, fnv1a32, kdf, kdf16};
++
++const SALT_AUTH_ID: &[u8] = b"AES Auth ID Encryption";
++const SALT_HDR_LEN_KEY: &[u8] = b"VMess Header AEAD Key_Length";
++const SALT_HDR_LEN_IV: &[u8] = b"VMess Header AEAD Nonce_Length";
++const SALT_HDR_KEY: &[u8] = b"VMess Header AEAD Key";
++const SALT_HDR_IV: &[u8] = b"VMess Header AEAD Nonce";
++
++pub(crate) fn gcm_seal(key16: &[u8], nonce12: &[u8], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
++    let cipher = Aes128Gcm::new_from_slice(key16).expect("gcm key length");
++    let nonce: [u8; 12] = nonce12.try_into().expect("nonce length");
++    cipher
++        .encrypt(
++            (&nonce).into(),
++            Payload {
++                msg: plaintext,
++                aad,
++            },
++        )
++        .expect("gcm seal cannot fail for valid key/nonce")
++}
++
++/// Opens a sealed buffer in place and returns the plaintext length: the tag
++/// stays at the tail of `ciphertext` (untouched memory is free to keep), and
++/// the caller slices to `..plain` when it needs the plaintext's own shape.
++/// Taking `&mut [u8]` instead of `&mut Vec<u8>` is what lets an `[u8; 18]`
++/// handshake length decrypt without a heap copy.
++pub(crate) fn gcm_open(
++    key16: &[u8],
++    nonce12: &[u8],
++    aad: &[u8],
++    ciphertext: &mut [u8],
++) -> io::Result<usize> {
++    if ciphertext.len() < 16 {
++        return Err(io::Error::other("ciphertext too short"));
++    }
++    let cipher = Aes128Gcm::new_from_slice(key16).map_err(|e| io::Error::other(e.to_string()))?;
++    let nonce: [u8; 12] = nonce12
++        .try_into()
++        .map_err(|_| io::Error::other("nonce length"))?;
++    let split = ciphertext.len() - 16;
++    let mut tag = [0u8; 16];
++    tag.copy_from_slice(&ciphertext[split..]);
++    cipher
++        .decrypt_in_place_detached(
++            (&nonce).into(),
++            aad,
++            &mut ciphertext[..split],
++            Tag::from_slice(&tag),
++        )
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "gcm auth failed"))?;
++    Ok(split)
++}
++
++pub(crate) fn unix_now() -> io::Result<u64> {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .map_err(|e| io::Error::other(format!("clock: {e}")))
++}
++
++/// Legacy header user hash: `HMAC-MD5(alterKey, BE64(timestamp))`.
++pub(crate) fn legacy_header_hash(alter_key: &[u8; 16], timestamp: u64) -> [u8; 16] {
++    use hmac::Mac;
++    type HmacMd5 = hmac::Hmac<md5::Md5>;
++    let mut mac = <HmacMd5 as Mac>::new_from_slice(alter_key).expect("hmac key length");
++    Mac::update(&mut mac, &timestamp.to_be_bytes());
++    mac.finalize().into_bytes().into()
++}
++
++/// Legacy header CFB IV: `MD5(BE64(timestamp) repeated 4 times)`.
++pub(crate) fn legacy_time_iv(timestamp: u64) -> [u8; 16] {
++    let mut input = [0u8; 32];
++    for slot in input.chunks_mut(8) {
++        slot.copy_from_slice(&timestamp.to_be_bytes());
++    }
++    md5::Md5::digest(input).into()
++}
++
++/// `CreateAuthID`: BE64(time) || rand4 || BE32(crc32(first 12)), AES-ECB
++/// encrypted with KDF16(cmdKey, "AES Auth ID Encryption").
++pub(crate) fn create_auth_id(cmd_key: &[u8; 16]) -> io::Result<[u8; 16]> {
++    let mut plain = [0u8; 16];
++    plain[..8].copy_from_slice(&unix_now()?.to_be_bytes());
++    random_bytes(&mut plain[8..12])?;
++    let crc = crc32_ieee(&plain[..12]);
++    plain[12..].copy_from_slice(&crc.to_be_bytes());
++    let key = kdf16(cmd_key, &[SALT_AUTH_ID]);
++    let cipher = aes::Aes128::new_from_slice(&key).expect("aes key length");
++    let mut block = aes::Block::clone_from_slice(&plain);
++    cipher.encrypt_block(&mut block);
++    Ok(block.into())
++}
++
++/// Plaintext request header (`rawClientConn.encodeHeader`): version, IV,
++/// key, response marker, option, padding<<4|security, reserved, command=TCP,
++/// port-then-address, random padding, FNV1a-32 checksum.
++pub(crate) fn build_request_header(
++    request_iv: &[u8; 16],
++    request_key: &[u8; 16],
++    response_header: u8,
++    option: u8,
++    security: u8,
++    // vmess request command: 1 tcp, 2 udp, 3 mux (xudp)
++    command: u8,
++    target: &Target,
++) -> io::Result<Vec<u8>> {
++    let mut rand = [0u8; 1];
++    random_bytes(&mut rand)?;
++    let pad_len = usize::from(rand[0] % 16);
++
++    let mut header = Vec::with_capacity(38 + 259 + pad_len + 4);
++    header.push(1);
++    header.extend_from_slice(request_iv);
++    header.extend_from_slice(request_key);
++    header.push(response_header);
++    header.push(option);
++    header.push(((pad_len as u8) << 4) | security);
++    header.push(0);
++    header.push(command);
++    header.extend_from_slice(&target.port().to_be_bytes());
++    match target {
++        Target::Ip(addr) => match addr.ip() {
++            std::net::IpAddr::V4(v4) => {
++                header.push(0x01);
++                header.extend_from_slice(&v4.octets());
++            }
++            std::net::IpAddr::V6(v6) => {
++                header.push(0x03);
++                header.extend_from_slice(&v6.octets());
++            }
++        },
++        Target::Domain(host, _) => {
++            let raw = host.as_bytes();
++            if raw.len() > 255 {
++                return Err(io::Error::other("domain too long"));
++            }
++            header.push(0x02);
++            header.push(raw.len() as u8);
++            header.extend_from_slice(raw);
++        }
++    }
++    if pad_len > 0 {
++        let mut pad = vec![0u8; pad_len];
++        random_bytes(&mut pad)?;
++        header.extend_from_slice(&pad);
++    }
++    let checksum = fnv1a32(&header);
++    header.extend_from_slice(&checksum.to_be_bytes());
++    Ok(header)
++}
++
++/// `SealVMessAEADHeader`: authID || GCM(len, AAD=authID) || connNonce(8) ||
++/// GCM(header, AAD=authID). alters only for the AEAD path (alterId == 0).
++pub(crate) fn seal_request_header(cmd_key: &[u8; 16], header: &[u8]) -> io::Result<Vec<u8>> {
++    let auth_id = create_auth_id(cmd_key)?;
++    let mut conn_nonce = [0u8; 8];
++    random_bytes(&mut conn_nonce)?;
++
++    let len_key = kdf16(cmd_key, &[SALT_HDR_LEN_KEY, &auth_id, &conn_nonce]);
++    let len_nonce: [u8; 12] = kdf(cmd_key, &[SALT_HDR_LEN_IV, &auth_id, &conn_nonce])[..12]
++        .try_into()
++        .expect("kdf output is 32 bytes");
++    let sealed_len = gcm_seal(
++        &len_key,
++        &len_nonce,
++        &auth_id,
++        &u16::try_from(header.len())
++            .map_err(|_| io::Error::other("header too large"))?
++            .to_be_bytes(),
++    );
++
++    let hdr_key = kdf16(cmd_key, &[SALT_HDR_KEY, &auth_id, &conn_nonce]);
++    let hdr_nonce: [u8; 12] = kdf(cmd_key, &[SALT_HDR_IV, &auth_id, &conn_nonce])[..12]
++        .try_into()
++        .expect("kdf output is 32 bytes");
++    let sealed_hdr = gcm_seal(&hdr_key, &hdr_nonce, &auth_id, header);
++
++    let mut out = Vec::with_capacity(16 + 18 + 8 + sealed_hdr.len());
++    out.extend_from_slice(&auth_id);
++    out.extend_from_slice(&sealed_len);
++    out.extend_from_slice(&conn_nonce);
++    out.extend_from_slice(&sealed_hdr);
++    Ok(out)
++}
++
++/// AEAD response keys: `SHA256(requestKey)[..16]` / `SHA256(requestIV)[..16]`.
++pub(crate) fn derive_response_keys(
++    request_key: &[u8; 16],
++    request_iv: &[u8; 16],
++) -> ([u8; 16], [u8; 16]) {
++    let key = Sha256::digest(request_key);
++    let iv = Sha256::digest(request_iv);
++    (
++        key[..16].try_into().expect("sha256 output is 32 bytes"),
++        iv[..16].try_into().expect("sha256 output is 32 bytes"),
++    )
++}
++
++/// Legacy response keys (alterId > 0): `MD5(requestKey)` / `MD5(requestIV)`.
++pub(crate) fn legacy_response_keys(
++    request_key: &[u8; 16],
++    request_iv: &[u8; 16],
++) -> ([u8; 16], [u8; 16]) {
++    (
++        md5::Md5::digest(request_key).into(),
++        md5::Md5::digest(request_iv).into(),
++    )
++}
++
++/// Precomputed GCM key/nonce pairs for the AEAD response header.
++pub(crate) type ResponseHeaderKeys = ([u8; 16], [u8; 12], [u8; 16], [u8; 12]);
++
++pub(crate) fn response_header_keys(
++    response_key: &[u8; 16],
++    response_iv: &[u8; 16],
++) -> ResponseHeaderKeys {
++    let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
++    let len_nonce: [u8; 12] = kdf(response_iv, &[b"AEAD Resp Header Len IV"])[..12]
++        .try_into()
++        .expect("kdf output is 32 bytes");
++    let hdr_key = kdf16(response_key, &[b"AEAD Resp Header Key"]);
++    let hdr_nonce: [u8; 12] = kdf(response_iv, &[b"AEAD Resp Header IV"])[..12]
++        .try_into()
++        .expect("kdf output is 32 bytes");
++    (len_key, len_nonce, hdr_key, hdr_nonce)
++}
+diff --git a/crates/core-runtime/src/route/mod.rs b/crates/core-runtime/src/route/mod.rs
+index 976d347..bfbce64 100644
+--- a/crates/core-runtime/src/route/mod.rs
++++ b/crates/core-runtime/src/route/mod.rs
+@@ -38,6 +38,7 @@ use crate::outbound::hysteria2::Hysteria2;
+ use crate::outbound::masque::Masque;
+ use crate::outbound::proxy::{HttpOut, Selector};
+ use crate::outbound::secure::{Trojan, Vless};
++use crate::outbound::vmess::Vmess;
+ use crate::outbound::tailscale::Tailscale;
+ use crate::outbound::urltest::Urltest;
+ use crate::outbound::wireguard::WireGuard;
+@@ -240,6 +241,7 @@ pub enum Outbound {
+     Http(HttpOut),
+     Vless(Vless),
+     Trojan(Trojan),
++    Vmess(Vmess),
+     Hysteria2(Hysteria2),
+     Masque(Masque),
+     WireGuard(Arc<WireGuard>),
+@@ -263,6 +265,7 @@ impl Outbound {
+             Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
+             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
+             Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
++            Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
+             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
+             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
+             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
+@@ -285,6 +288,7 @@ impl Outbound {
+             Outbound::Masque(masque) => masque.connect_udp(target).await,
+             Outbound::Vless(vless) => vless.connect_udp(target).await,
+             Outbound::Trojan(trojan) => trojan.connect_udp(target).await,
++            Outbound::Vmess(vmess) => vmess.connect_udp(target).await,
+             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
+             Outbound::Block(_) => Err(io::Error::new(
+                 io::ErrorKind::ConnectionRefused,
+@@ -316,6 +320,7 @@ impl Outbound {
+             Outbound::Direct(d) => apply(&mut d.dial),
+             Outbound::Vless(v) => apply(&mut v.dial),
+             Outbound::Trojan(t) => apply(&mut t.dial),
++            Outbound::Vmess(m) => apply(&mut m.dial),
+             Outbound::Http(h) => apply(&mut h.dial),
+             _ => {}
+         }
+@@ -335,6 +340,7 @@ impl Outbound {
+             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
+             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
+             "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
++            "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
+             "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
+             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
+             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
+-- 
+2.47.3
+
