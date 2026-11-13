@@ -1,4 +1,5 @@
 name: OpenWrt packages
+
 on:
   workflow_dispatch:
     inputs:
@@ -6,8 +7,10 @@ on:
         description: Existing Xrust binary release tag
         required: true
         default: rust-x-v0.0.1
+
 permissions:
   contents: write
+
 jobs:
   packages:
     runs-on: ubuntu-24.04
@@ -23,8 +26,8 @@ jobs:
           if [ -f binaries/openwrt-manifest.json ]; then
             python3 -c 'import json; assert not json.load(open("binaries/openwrt-manifest.json"))["apk_signed"], "Signed packages already published; refusing to overwrite them with unsigned packages"'
           fi
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -D binaries -p 'rust-x-*.tar.gz' -p SHA256SUMS
-          (cd binaries && grep '  rust-x-.*\.tar.gz$' SHA256SUMS | sha256sum -c -)
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -D binaries -p 'rust-x-aarch64-*.tar.gz' -p SHA256SUMS
+          (cd binaries && grep '  rust-x-aarch64-.*\.tar.gz$' SHA256SUMS | sha256sum -c -)
           for f in binaries/*.tar.gz; do tar -xzf "$f" -C binaries; done
           git fetch origin tag "$RELEASE_TAG"
           echo "BINARY_COMMIT=$(git rev-parse "$RELEASE_TAG^{commit}")" >> "$GITHUB_ENV"
@@ -33,10 +36,7 @@ jobs:
         run: bash scripts/openwrt_apk_tool.sh
       - name: Package
         run: |
-          # Historical unsigned releases predate MIPS; keep backfill possible.
-          cpus=aarch64,x86_64
-          if [ -f "binaries/rust-x-mipsel-v$VERSION" ]; then cpus="$cpus,mipsel"; fi
-          sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --cpus "$cpus" --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT"
+          sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --cpus "aarch64" --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT"
           tar -czf dist/openwrt-packaging-source.tar.gz scripts/package_openwrt.py scripts/sign_openwrt.py scripts/openwrt_apk_tool.sh packaging
           cat binaries/SHA256SUMS dist/OPENWRT-SHA256SUMS | sort -u > dist/SHA256SUMS
           (cd dist && sha256sum openwrt-manifest.json openwrt-packaging-source.tar.gz >> SHA256SUMS)
