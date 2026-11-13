@@ -1,13 +1,13 @@
 # Xrust protocol profile
 
-Supported release platforms: OpenWrt x86_64 and aarch64_cortex-a53 only.
+Supported release platforms: OpenWrt aarch64 only.
 CI tests run on Linux; both release targets use static musl binaries.
 Other platform code inherited from upstream is not a supported build target.
 
 Firefox/Safari and Chrome for XHTTP now use our Sing-Box X 1.0.3 captures.
 See [the uTLS refresh report](RUST-X-UTLS-2026-10-10.md).
 
-Xrust does not ship Naive, VMess, Shadowsocks, TUIC, AnyTLS, Snell,
+Xrust does not ship Naive, Shadowsocks, TUIC, AnyTLS, Snell,
 ShadowTLS, FPTN, outbound SOCKS, OpenVPN or a Trojan server (inbound). Config
 `check` rejects these types. SOCKS4/4a client requests are rejected; SOCKS5
 and HTTP mixed inbounds remain available for Forkop DirectProxy.
