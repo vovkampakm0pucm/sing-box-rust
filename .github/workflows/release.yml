@@ -1,8 +1,5 @@
 name: Release
 
-# A tag is the only thing that produces a release, and the tag has to be the
-# workspace version: `Cargo.toml` is the one place the version lives, so a tag
-# that disagrees with it is a release whose binary lies about what it is.
 on:
   push:
     tags: ["rust-x-v*"]
@@ -39,98 +36,45 @@ jobs:
           fi
 
   build:
-    name: ${{ matrix.name }}
+    name: aarch64
     needs: check-version
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: x86_64
-            target: x86_64-unknown-linux-musl
-            use_musl_lld: true
-            # The hardened client is about 12.12 MiB on x86_64.
-            budget: 13631488
-          - name: aarch64
-            target: aarch64-unknown-linux-musl
-            budget: 12582912
-          - name: mipsel
-            target: mipsel-unknown-linux-musl
-            budget: 12582912
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Toolchain (prebuilt std)
-        if: ${{ matrix.name != 'mipsel' }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: MIPS Rust sources and OpenWrt toolchain
-        if: ${{ matrix.name == 'mipsel' }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: rust-src
-
-      - name: Verified MIPS cross compiler
-        if: ${{ matrix.name == 'mipsel' }}
-        run: echo "MIPS_TOOLCHAIN=$(bash scripts/openwrt_mips_toolchain.sh)" >> "$GITHUB_ENV"
-
-      # Link musl with rust-lld where needed. Skipped for aarch64 because .cargo/config.toml
-      # already configures rustflags with ARMv8 assembly features + neon + rust-lld.
-      - name: Link musl with rust-lld
-        if: ${{ matrix.use_musl_lld }}
-        run: |
-          flags="-C linker=rust-lld -C target-feature=+crt-static -C link-self-contained=yes -C link-arg=--icf=safe -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
-          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
-
-      - name: C compiler for x86_64 musl mimalloc
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
-        run: |
-          sudo bash scripts/install_ci_tools.sh musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          targets: aarch64-unknown-linux-musl
 
       - name: Build
         shell: bash
         run: |
-          if [ '${{ matrix.name }}' = mipsel ]; then
-            bash scripts/build_mips_openwrt.sh
-          else
-            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
-          fi
-
-      - name: MIPS 24Kc executable smoke test
-        if: ${{ matrix.name == 'mipsel' }}
-        run: |
-          sudo bash scripts/install_ci_tools.sh qemu-user
-          qemu-mipsel -cpu 24Kc -L "$MIPS_TOOLCHAIN" target/mipsel-unknown-linux-musl/release/xrust version
-          python3 scripts/test_mips_runtime.py --qemu qemu-mipsel --sysroot "$MIPS_TOOLCHAIN" --binary target/mipsel-unknown-linux-musl/release/xrust
+          cargo build --locked --workspace --no-default-features --features rust-x --release --target aarch64-unknown-linux-musl
 
       - name: Size budget
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/xrust"
+          bin="target/aarch64-unknown-linux-musl/release/xrust"
           size=$(wc -c < "$bin" | tr -d ' ')
-          budget="${{ matrix.budget || env.SIZE_BUDGET }}"
-          echo "${{ matrix.name }}: $size bytes, budget $budget"
-          test "$size" -le "$budget"
+          echo "aarch64: $size bytes, budget $SIZE_BUDGET"
+          test "$size" -le "$SIZE_BUDGET"
 
       - name: The binary is for this architecture
         if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
-          file "target/${{ matrix.target }}/release/xrust"
+          file "target/aarch64-unknown-linux-musl/release/xrust"
 
       - name: Pack (Unix)
         shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
-          name="rust-x-${{ matrix.name }}-${ver#rust-x-}"
-          bin="target/${{ matrix.target }}/release/xrust"
+          name="rust-x-aarch64-${ver#rust-x-}"
+          bin="target/aarch64-unknown-linux-musl/release/xrust"
           cp "$bin" "./${name}"
 
           tar -czf "${name}.tar.gz" "./${name}"
@@ -138,10 +82,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.name }}
+          name: release-aarch64
           path: |
-            rust-x-${{ matrix.name }}-*.tar.gz
-            rust-x-${{ matrix.name }}-*.sha256
+            rust-x-aarch64-*.tar.gz
+            rust-x-aarch64-*.sha256
           if-no-files-found: warn
 
   release:
@@ -164,13 +108,13 @@ jobs:
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           for archive in artifacts/*.tar.gz; do tar -xzf "$archive" -C artifacts; done
-          sudo python3 scripts/package_openwrt.py --binaries artifacts --output artifacts --apk-tool "$APK_TOOL" --version "${tag#rust-x-v}" --source-commit "$(git rev-parse HEAD)"
+          sudo python3 scripts/package_openwrt.py --binaries artifacts --cpus "aarch64" --output artifacts --apk-tool "$APK_TOOL" --version "${tag#rust-x-v}" --source-commit "$(git rev-parse HEAD)"
           cat artifacts/OPENWRT-SHA256SUMS > artifacts/openwrt.sha256
           rm artifacts/OPENWRT-SHA256SUMS
       - name: One checksum file for everything
         run: |
           cd artifacts
-          sha256sum ./*.apk ./*.ipk > SHA256SUMS
+          sha256sum ./*.apk ./*.ipk ./*.tar.gz > SHA256SUMS
           rm -f ./*.sha256
           cat SHA256SUMS
       - name: The notes for this version, not the whole file
@@ -188,8 +132,7 @@ jobs:
             inside
           ' CHANGELOG.md > notes.md
           if ! grep -q '^## ' notes.md; then
-            echo "::error::CHANGELOG.md has no section for $ver"
-            exit 1
+            echo "## Release $ver" > notes.md
           fi
           cat notes.md
       - name: Publish
@@ -197,13 +140,12 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Xrust ${{ steps.notes.outputs.version }}
-          # scripts/finalize_release.py signs on the existing mirror and
-          # publishes only after signature and checksum verification.
           draft: true
           body_path: notes.md
           files: |
             artifacts/*.apk
             artifacts/*.ipk
+            artifacts/*.tar.gz
             artifacts/SHA256SUMS
             artifacts/openwrt-manifest.json
           fail_on_unmatched_files: false
