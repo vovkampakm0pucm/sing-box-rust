@@ -15,6 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  SIZE_BUDGET: 12582912
 
 jobs:
   check-version:
@@ -56,7 +57,15 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cargo build --workspace --no-default-features --features rust-x --release --target aarch64-unknown-linux-musl
+          cargo build --locked --workspace --no-default-features --features rust-x --release --target aarch64-unknown-linux-musl
+
+      - name: Size budget
+        shell: bash
+        run: |
+          bin="target/aarch64-unknown-linux-musl/release/xrust"
+          size=$(wc -c < "$bin" | tr -d ' ')
+          echo "aarch64: $size bytes, budget $SIZE_BUDGET"
+          test "$size" -le "$SIZE_BUDGET"
 
       - name: The binary is for this architecture
         if: ${{ runner.os != 'Windows' }}
