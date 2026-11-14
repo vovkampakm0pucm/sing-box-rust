@@ -9,13 +9,14 @@ pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
 pub mod noise;
+mod tcp_window;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -54,56 +55,6 @@ const DEFAULT_MTU: usize = 1408;
 const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SOCKET_BUF: usize = 65_536;
-// Keep the small buffers as a fallback when the shared WAN allowance is full.
-const TCP_RECV_BUF: usize = 128 * 1024;
-// Bytes must remain queued until ACKed. Small TX and RX rings otherwise cap
-// throughput at roughly their capacity divided by the path RTT.
-const TCP_WAN_RECV_BUF: usize = 2 * 1024 * 1024;
-const TCP_WAN_SEND_BUF: usize = 2 * 1024 * 1024;
-const TCP_WINDOW_EXTRA: usize = TCP_WAN_RECV_BUF + TCP_WAN_SEND_BUF - TCP_RECV_BUF - SOCKET_BUF;
-// Shared across endpoints: a subscription with many WG endpoints must not
-// multiply the extra window allowance. Existing small buffers remain available
-// when the allowance is exhausted; this is not a total process memory cap.
-// The supported 32-bit OpenWrt target is MIPS 24Kc, commonly RAM-limited.
-// Keep two large connections there instead of consuming a 32 MiB allowance.
-#[cfg(target_pointer_width = "32")]
-const TCP_WINDOW_BUDGET: usize = 8 * 1024 * 1024;
-#[cfg(not(target_pointer_width = "32"))]
-const TCP_WINDOW_BUDGET: usize = 32 * 1024 * 1024;
-static TCP_WINDOW_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-fn tcp_buffer_sizes(reserved: bool) -> (usize, usize) {
-    if reserved {
-        (TCP_WAN_RECV_BUF, TCP_WAN_SEND_BUF)
-    } else {
-        (TCP_RECV_BUF, SOCKET_BUF)
-    }
-}
-
-struct TcpWindowReservation<'a>(&'a AtomicUsize);
-
-impl<'a> TcpWindowReservation<'a> {
-    fn acquire(bytes: &'a AtomicUsize) -> Option<Self> {
-        let mut used = bytes.load(Ordering::Relaxed);
-        loop {
-            let next = used.checked_add(TCP_WINDOW_EXTRA)?;
-            if next > TCP_WINDOW_BUDGET {
-                return None;
-            }
-            match bytes.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return Some(Self(bytes)),
-                Err(actual) => used = actual,
-            }
-        }
-    }
-}
-
-impl Drop for TcpWindowReservation<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(TCP_WINDOW_EXTRA, Ordering::Relaxed);
-    }
-}
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -708,8 +659,39 @@ fn bind_network_udp(ipv6: bool, port: u16, mark: Option<u32>) -> io::Result<UdpS
     UdpSocket::from_std(socket.into())
 }
 
+fn send_control(sock: &UdpSocket, bytes: &[u8], addr: SocketAddr, class: u8) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let socket = socket2::SockRef::from(sock);
+        let original = if addr.is_ipv4() {
+            socket.tos_v4()?
+        } else {
+            socket.tclass_v6()?
+        };
+        if addr.is_ipv4() {
+            socket.set_tos_v4(class as u32)?;
+        } else {
+            socket.set_tclass_v6(class as u32)?;
+        }
+        let result = sock.try_send_to(bytes, addr);
+        let restore = if addr.is_ipv4() {
+            socket.set_tos_v4(original)
+        } else {
+            socket.set_tclass_v6(original)
+        };
+        restore?;
+        result
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = class;
+        sock.try_send_to(bytes, addr)
+    }
+}
+
 struct TcpConn {
-    _window_reservation: Option<TcpWindowReservation<'static>>,
+    receive_window: tcp_window::ReceiveWindow<'static>,
+    send_window: tcp_window::SendWindow<'static>,
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
@@ -735,6 +717,7 @@ struct HsRuntime {
     attempt: u32,
     started: Instant,
     retry_at: Instant,
+    max_attempts: u32,
 }
 
 struct PeerRt {
@@ -751,11 +734,21 @@ struct PeerRt {
     pending: VecDeque<Vec<u8>>,
     last_recv: Option<Instant>,
     last_sent: Option<Instant>,
+    reactive_keepalive: Option<Instant>,
+    another_keepalive: bool,
     flush: bool,
     kick: bool,
 }
 
 impl PeerRt {
+    fn received_data(&mut self, now: Instant, timeout: Duration) {
+        if self.reactive_keepalive.is_none() {
+            self.reactive_keepalive = Some(now + timeout);
+        } else {
+            self.another_keepalive = true;
+        }
+    }
+
     fn new(endpoint: PeerConfig) -> Self {
         Self {
             endpoint,
@@ -769,6 +762,8 @@ impl PeerRt {
             pending: VecDeque::new(),
             last_recv: None,
             last_sent: None,
+            reactive_keepalive: None,
+            another_keepalive: false,
             flush: false,
             kick: false,
         }
@@ -946,6 +941,10 @@ impl Stack {
     }
 
     fn send_raw(&self, pi: usize, bytes: &[u8]) {
+        self.send_raw_class(pi, bytes, None);
+    }
+
+    fn send_raw_class(&self, pi: usize, bytes: &[u8], class: Option<u8>) {
         let Some(addr) = self.peers[pi].resolved else {
             return;
         };
@@ -962,7 +961,11 @@ impl Stack {
             },
             SocketAddr::V4(_) => &self.sock,
         };
-        if let Err(e) = sock.try_send_to(bytes, addr)
+        let result = match class {
+            Some(class) => send_control(sock, bytes, addr, class),
+            None => sock.try_send_to(bytes, addr),
+        };
+        if let Err(e) = result
             && e.kind() != io::ErrorKind::WouldBlock
         {
             logging::debug(format_args!("wireguard[{}]: udp send: {e}", self.cfg.tag));
@@ -977,10 +980,14 @@ impl Stack {
             self.send_raw(pi, init);
             return;
         };
+        let mut seed = [0u8; 4];
+        awg::fill_random(&mut seed);
+        let mut counter = u32::from_ne_bytes(seed);
         for chain in params.ipackets.iter().flatten() {
-            let pkt = awg::render_chain(chain);
+            let pkt = awg::render_chain_with_counter(chain, counter);
             if !pkt.is_empty() {
                 self.send_raw(pi, &pkt);
+                counter = counter.wrapping_add(1);
             }
         }
         for _ in 0..params.junk_count {
@@ -990,7 +997,9 @@ impl Stack {
             }
             let mut buf = vec![0u8; n];
             awg::fill_random(&mut buf);
-            self.send_raw(pi, &buf);
+            let mut class = [0u8; 1];
+            awg::fill_random(&mut class);
+            self.send_raw_class(pi, &buf, Some(class[0]));
         }
         let pad = params.padding(awg::INIT);
         let window = self.peers[pi].udp_window;
@@ -1008,7 +1017,7 @@ impl Stack {
             let nonce = pkt[..12].to_vec();
             awg::mask_header(key, &nonce, &mut pkt[pad..pad + init.len()]);
         }
-        self.send_raw(pi, &pkt);
+        self.send_raw_class(pi, &pkt, Some(0x88));
     }
 
     fn send_handshake_resp(&self, pi: usize, resp: &[u8], src: SocketAddr) {
@@ -1037,7 +1046,7 @@ impl Stack {
             awg::mask_header(key, &nonce, &mut pkt[pad..pad + resp.len()]);
         }
         if let Some(s) = sock {
-            let _ = s.try_send_to(&pkt, src);
+            let _ = send_control(s, &pkt, src, 0x88);
         }
     }
 
@@ -1049,6 +1058,10 @@ impl Stack {
         let session = peer.session.as_mut()?;
         let params = self.cfg.awg.as_deref();
         let s4 = params.map_or(0, |a| a.padding(awg::TRANSPORT));
+        if params.is_some() {
+            // Like the kernel, grow the window from the unpadded datagram.
+            peer.udp_window = peer.udp_window.max((s4 + 32 + pkt.len()) as u32);
+        }
         let pad_len = params.map_or_else(
             || (16 - pkt.len() % 16) % 16,
             |a| awg::transport_padding(a, peer.udp_window, pkt.len(), s4),
@@ -1066,8 +1079,9 @@ impl Stack {
                 let (prefix, message) = out.split_at_mut(s4);
                 awg::mask_header(key, prefix, &mut message[..16]);
             }
-            peer.udp_window = peer.udp_window.max(out.len() as u32);
         }
+        peer.reactive_keepalive = None;
+        peer.another_keepalive = false;
         Some(out)
     }
 
@@ -1142,6 +1156,22 @@ impl Stack {
         }
     }
 
+    fn handshake_timeout(&self) -> Duration {
+        self.cfg
+            .awg
+            .as_ref()
+            .map(|a| awg::pick_secs(a.rekey_timeout, REKEY_TIMEOUT.as_secs()))
+            .unwrap_or(REKEY_TIMEOUT)
+    }
+
+    fn reactive_timeout(&self) -> Duration {
+        self.cfg
+            .awg
+            .as_ref()
+            .map(|a| awg::pick_secs(a.keepalive_timeout, 10))
+            .unwrap_or(Duration::from_secs(10))
+    }
+
     fn start_hs(&mut self, pi: usize) -> bool {
         if self.peers[pi].resolved.is_none() {
             return false;
@@ -1173,11 +1203,18 @@ impl Stack {
             self.cfg.tag, hs.sender_index
         ));
         self.index_peer.insert(hs.sender_index, pi);
-        let retry_at = now + REKEY_TIMEOUT + jitter();
+        let retry_at = now + self.handshake_timeout() + jitter();
+        let max_attempts = self
+            .cfg
+            .awg
+            .as_ref()
+            .map(|a| awg::pick_opt(a.max_handshake_attempts, REKEY_ATTEMPT_COUNT))
+            .unwrap_or(REKEY_ATTEMPT_COUNT);
         self.peers[pi].hs = Some(HsRuntime {
             attempt: 1,
             started: now,
             retry_at,
+            max_attempts,
             hs,
         });
         self.peers[pi].kick = false;
@@ -1198,12 +1235,17 @@ impl Stack {
                     return;
                 };
                 let port = self.alloc_port();
-                let window_reservation = TcpWindowReservation::acquire(&TCP_WINDOW_BYTES);
-                let (recv_size, send_size) = tcp_buffer_sizes(window_reservation.is_some());
+                let recv_size = tcp_window::SMALL_RECV;
+                let send_size = tcp_window::SMALL_SEND;
                 let mut socket = TcpSock::new(
                     TcpBuffer::new(vec![0; recv_size]),
                     TcpBuffer::new(vec![0; send_size]),
                 );
+                // Negotiate future RX growth before SYN, while advertising
+                // only the memory actually supplied to the socket.
+                socket
+                    .set_receive_capacity_limit(tcp_window::LARGE)
+                    .expect("bounded receive capacity on a new TCP socket");
                 socket.set_nagle_enabled(false);
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
@@ -1221,7 +1263,8 @@ impl Stack {
                 self.tcp.insert(
                     id,
                     TcpConn {
-                        _window_reservation: window_reservation,
+                        receive_window: tcp_window::ReceiveWindow::default(),
+                        send_window: tcp_window::SendWindow::default(),
                         handle,
                         dst,
                         to_caller,
@@ -1349,11 +1392,6 @@ impl Stack {
             return;
         }
         let recv_idx = u32::from_le_bytes(msg[4..8].try_into().expect("4 bytes"));
-        if msg_type == noise::MSG_TRANSPORT
-            && let Some(&pi) = self.index_peer.get(&recv_idx)
-        {
-            self.peers[pi].udp_window = self.peers[pi].udp_window.max(buf.len() as u32);
-        }
         logging::debug(format_args!(
             "wireguard[{}]: recv type={msg_type} len={} idx={recv_idx} src={src}",
             self.cfg.tag,
@@ -1467,9 +1505,6 @@ impl Stack {
     }
 
     fn on_cookie(&mut self, msg: &[u8], recv_idx: u32) {
-        if self.cfg.awg.as_ref().is_some_and(|a| a.disable_cookies) {
-            return;
-        }
         let Some(&pi) = self.index_peer.get(&recv_idx) else {
             return;
         };
@@ -1483,7 +1518,7 @@ impl Stack {
                 self.send_handshake_init(pi, hsrt.hs.initiation());
                 let now = Instant::now();
                 hsrt.attempt += 1;
-                hsrt.retry_at = now + REKEY_TIMEOUT + jitter();
+                hsrt.retry_at = now + self.handshake_timeout() + jitter();
                 self.peers[pi].cookie = Some((cookie, now + COOKIE_TTL));
                 self.peers[pi].hs = Some(hsrt);
             }
@@ -1515,6 +1550,12 @@ impl Stack {
             self.recycle(plain);
             return;
         }
+        let s4 = self
+            .cfg
+            .awg
+            .as_ref()
+            .map_or(0, |a| a.padding(awg::TRANSPORT));
+        self.peers[pi].udp_window = self.peers[pi].udp_window.max((s4 + msg.len()) as u32);
         self.peers[pi].last_recv = Some(Instant::now());
         self.peers[pi].resolved = Some(src);
         if plain.is_empty() {
@@ -1555,6 +1596,10 @@ impl Stack {
             ));
             self.recycle(plain);
             return;
+        }
+        if self.cfg.awg.is_some() {
+            let timeout = self.reactive_timeout();
+            self.peers[pi].received_data(Instant::now(), timeout);
         }
         let is_local = match dst {
             IpAddr::V4(v4) => self.cfg.local_addr_v4 == Some(v4),
@@ -1653,6 +1698,7 @@ impl Stack {
 
     fn maintain_tcp(&mut self) -> bool {
         let mut drained_receive_window = false;
+        let now = Instant::now();
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
             let Some(mut conn) = self.tcp.remove(&id) else {
@@ -1662,6 +1708,9 @@ impl Stack {
             let mut caller_gone = false;
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
+                let pending = conn.from_caller.iter().map(|(bytes, _)| bytes.len()).sum();
+                conn.send_window.maintain(sock, now, pending);
+                let mut received = 0;
 
                 while let Some((front, _)) = conn.from_caller.front_mut() {
                     match sock.send_slice(front) {
@@ -1692,6 +1741,7 @@ impl Stack {
                         }) {
                             Ok(data) if data.is_empty() => break,
                             Ok(data) => {
+                                received += data.len();
                                 drained_receive_window = true;
                                 match conn.to_caller.try_send(data) {
                                     Ok(()) => {}
@@ -1716,6 +1766,7 @@ impl Stack {
                         }
                     }
                 }
+                conn.receive_window.maintain(sock, now, received);
                 // The caller is gone: FIN the remote, or `finished` waits for
                 // a remote FIN that can never arrive (we never sent one) and
                 // the socket leaks in the set forever — three cancelled LuCI
@@ -1790,8 +1841,15 @@ impl Stack {
                 .hs
                 .as_ref()
                 .filter(|h| now >= h.retry_at)
-                .map(|h| (h.attempt, h.started, h.hs.initiation().to_vec()));
-            if let Some((attempt, started, initiation)) = retry {
+                .map(|h| {
+                    (
+                        h.attempt,
+                        h.started,
+                        h.max_attempts,
+                        h.hs.initiation().to_vec(),
+                    )
+                });
+            if let Some((attempt, started, max_attempts, initiation)) = retry {
                 // AWG 3.x: rekey_timeout / max_handshake_attempts ranges are
                 // re-picked per attempt cycle.
                 let rekey_timeout = self
@@ -1800,13 +1858,15 @@ impl Stack {
                     .as_ref()
                     .map(|a| awg::pick_secs(a.rekey_timeout, REKEY_TIMEOUT.as_secs()))
                     .unwrap_or(REKEY_TIMEOUT);
-                let max_attempts = self
-                    .cfg
-                    .awg
-                    .as_ref()
-                    .map(|a| awg::pick_opt(a.max_handshake_attempts, REKEY_ATTEMPT_COUNT))
-                    .unwrap_or(REKEY_ATTEMPT_COUNT);
-                if attempt >= max_attempts || now.duration_since(started) >= REKEY_ATTEMPT_TIME {
+                if attempt >= max_attempts
+                    || (self
+                        .cfg
+                        .awg
+                        .as_ref()
+                        .and_then(|a| a.max_handshake_attempts)
+                        .is_none()
+                        && now.duration_since(started) >= REKEY_ATTEMPT_TIME)
+                {
                     self.peers[pi].hs = None;
                     self.peers[pi].pending.clear();
                 } else {
@@ -1855,6 +1915,22 @@ impl Stack {
                 && now.duration_since(since) >= rekey_after
             {
                 self.start_hs(pi);
+            }
+
+            if self.peers[pi].session.is_some()
+                && self.peers[pi]
+                    .reactive_keepalive
+                    .is_some_and(|at| now >= at)
+            {
+                let another = self.peers[pi].another_keepalive;
+                if let Some(msg) = self.seal_transport(pi, &[]) {
+                    self.send_raw(pi, &msg);
+                    self.wire_buffers.push(msg);
+                    self.peers[pi].last_sent = Some(now);
+                    if another {
+                        self.peers[pi].reactive_keepalive = Some(now + self.reactive_timeout());
+                    }
+                }
             }
 
             if let Some(range) = self.peers[pi].endpoint.keepalive
@@ -1910,9 +1986,28 @@ impl Stack {
                 consider(exp);
             }
             if peer.session.is_some() {
+                if let Some(at) = peer.reactive_keepalive {
+                    consider(at);
+                }
                 if let Some(since) = peer.session_since {
-                    consider(since + REKEY_AFTER_TIME);
-                    consider(since + REJECT_AFTER_TIME);
+                    let rekey = self
+                        .cfg
+                        .awg
+                        .as_ref()
+                        .and_then(|a| a.rekey_after_time)
+                        .map(|(lo, _)| Duration::from_secs(lo as u64))
+                        .unwrap_or(REKEY_AFTER_TIME);
+                    let reject = self
+                        .cfg
+                        .awg
+                        .as_ref()
+                        .and_then(|a| a.reject_after_time)
+                        .map(|(_, hi)| Duration::from_secs(hi as u64))
+                        .unwrap_or(REJECT_AFTER_TIME);
+                    if peer.hs.is_none() {
+                        consider(since + rekey);
+                    }
+                    consider(since + reject);
                 }
                 if let Some(range) = peer.endpoint.keepalive {
                     let interval = Duration::from_secs(awg::pick_opt(Some(range), 0) as u64);
@@ -1927,6 +2022,12 @@ impl Stack {
         for conn in self.tcp.values() {
             if conn.resp.is_some() {
                 consider(conn.created + CONNECT_TIMEOUT);
+            }
+            if let Some(at) = conn.send_window.deadline() {
+                consider(at);
+            }
+            if let Some(at) = conn.receive_window.deadline() {
+                consider(at);
             }
         }
         // smoltcp itself may want a poll — data maintain_tcp just pushed into
@@ -2414,60 +2515,214 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn tcp_window_budget_survives_concurrent_acquire_and_drop() {
-        let bytes = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..32 {
-                let bytes = &bytes;
-                scope.spawn(move || {
-                    for _ in 0..500 {
-                        let reservation = super::TcpWindowReservation::acquire(bytes);
-                        assert!(
-                            bytes.load(std::sync::atomic::Ordering::Relaxed)
-                                <= super::TCP_WINDOW_BUDGET
-                        );
-                        std::thread::yield_now();
-                        drop(reservation);
-                    }
-                });
-            }
-        });
-        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn tcp_window_budget_is_bounded_and_reusable() {
-        let bytes = std::sync::atomic::AtomicUsize::new(0);
-        let mut reservations = Vec::new();
-        while let Some(reservation) = super::TcpWindowReservation::acquire(&bytes) {
-            reservations.push(reservation);
-        }
-        assert_eq!(
-            reservations.len(),
-            if cfg!(target_pointer_width = "32") {
-                2
-            } else {
-                8
-            }
-        );
-        assert_eq!(
-            super::tcp_buffer_sizes(true),
-            (2 * 1024 * 1024, 2 * 1024 * 1024)
-        );
-        assert_eq!(super::tcp_buffer_sizes(false), (128 * 1024, 64 * 1024));
-        let used = bytes.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(used <= super::TCP_WINDOW_BUDGET);
-        assert!(used + super::TCP_WINDOW_EXTRA > super::TCP_WINDOW_BUDGET);
-        drop(reservations.pop());
-        let reused = super::TcpWindowReservation::acquire(&bytes).unwrap();
-        assert!(super::TcpWindowReservation::acquire(&bytes).is_none());
-        drop(reused);
-        drop(reservations);
-        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
     use super::*;
+
+    async fn compat_stack(extra: Value) -> (Stack, UdpSocket) {
+        use base64::Engine;
+        let mut obj = wg_obj(extra);
+        let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2; 32]));
+        obj.get_mut("peers").unwrap()[0]["public_key"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(public.as_bytes()));
+        let wg = WireGuard::build(&obj, "test").unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sock.writable().await.unwrap();
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut device = WgDevice::new(1408);
+        let iface = Interface::new(
+            IfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmolInstant::now(),
+        );
+        let mut peer = PeerRt::new(wg.cfg.peers[0].clone());
+        peer.resolved = Some(sink.local_addr().unwrap());
+        let stack = Stack {
+            cfg: Arc::new(wg.cfg),
+            sock,
+            sock_v6: None,
+            device,
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            peers: vec![peer],
+            index_peer: HashMap::new(),
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            next_port: EPHEMERAL_BASE,
+            outbox: Vec::new(),
+            wire_buffers: Vec::new(),
+            udp_gso: true,
+        };
+        (stack, sink)
+    }
+
+    fn compat_session(stack: &mut Stack) -> noise::Session {
+        assert!(stack.start_hs(0));
+        let hs = &stack.peers[0].hs.as_ref().unwrap().hs;
+        let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2; 32]));
+        let init = noise::process_initiation(&[2; 32], public.as_bytes(), hs.initiation()).unwrap();
+        let (response, session) = noise::build_response(&init, &[2; 32], None, 2);
+        let index = hs.sender_index;
+        stack.on_response(&response, index, stack.peers[0].resolved.unwrap());
+        assert!(stack.peers[0].session.is_some());
+        session
+    }
+
+    #[tokio::test]
+    async fn awg_compat_protected_transport_larger_prefix_and_bounded_window() {
+        use base64::Engine;
+        for prefix in [12, 16, 64] {
+            let (mut stack, _sink) =
+                compat_stack(json!({"s1":prefix,"s2":prefix,"s3":prefix,"s4":prefix,
+                "header_protection_key":base64::engine::general_purpose::STANDARD.encode([3;32]),
+                "content_padding_addition":100}))
+                .await;
+            let mut server = compat_session(&mut stack);
+            let mut packet = build_ipv4_udp(
+                Ipv4Addr::new(10, 66, 66, 2),
+                Ipv4Addr::new(10, 66, 66, 1),
+                123,
+                456,
+                &[7; 372],
+            );
+            assert_eq!(packet.len(), 400);
+            let wire = stack.seal_transport(0, &packet).unwrap();
+            assert_eq!(wire.len(), 500usize.max(prefix + 32 + packet.len()));
+            assert_eq!(
+                stack.peers[0].udp_window,
+                500u32.max((prefix + 32 + packet.len()) as u32)
+            );
+            let mut message = wire[prefix..].to_vec();
+            awg::mask_header(&[3; 32], &wire[..12], &mut message[..16]);
+            assert_eq!(
+                noise::trim_ip_padding(&server.open(&message).unwrap()),
+                packet
+            );
+            // Forged unauthenticated transport cannot enlarge the padding budget.
+            packet.resize(2000, 0);
+            let mut ciphertext = server.seal(&packet).unwrap();
+            *ciphertext.last_mut().unwrap() ^= 1; // invalid authentication tag
+            let mut forged = vec![0x55; prefix];
+            awg::mask_header(&[3; 32], &forged[..12], &mut ciphertext[..16]);
+            forged.extend_from_slice(&ciphertext);
+            let before = stack.peers[0].udp_window;
+            stack.process_inbound(&forged, stack.peers[0].resolved.unwrap());
+            assert_eq!(stack.peers[0].udp_window, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn awg_compat_cookie_is_consumed_even_when_challenges_disabled() {
+        use blake2::Digest;
+        use chacha20poly1305::{
+            KeyInit, XChaCha20Poly1305, XNonce,
+            aead::{Aead, Payload},
+        };
+        let (mut stack, _sink) =
+            compat_stack(json!({"disable_cookies":true,"rekey_timeout":50})).await;
+        stack.start_hs(0);
+        let hs = &stack.peers[0].hs.as_ref().unwrap().hs;
+        let index = hs.sender_index;
+        let mut input = b"cookie--".to_vec();
+        input.extend_from_slice(&stack.peers[0].endpoint.public_key);
+        let key = blake2::Blake2s256::digest(&input);
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let nonce = [8; 24];
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &[9; 16],
+                    aad: &hs.mac1(),
+                },
+            )
+            .unwrap();
+        let mut msg = 3u32.to_le_bytes().to_vec();
+        msg.extend_from_slice(&index.to_le_bytes());
+        msg.extend_from_slice(&nonce);
+        msg.extend_from_slice(&encrypted);
+        stack.on_cookie(&msg, index);
+        assert_eq!(stack.peers[0].cookie.unwrap().0, [9; 16]);
+        let delay = stack.peers[0]
+            .hs
+            .as_ref()
+            .unwrap()
+            .retry_at
+            .duration_since(Instant::now());
+        assert!(delay >= Duration::from_secs(49) && delay < Duration::from_secs(51));
+    }
+
+    #[tokio::test]
+    async fn awg_compat_reactive_keepalive_deadline_send_and_cancel() {
+        let (mut stack, _sink) = compat_stack(json!({"keepalive_timeout":30})).await;
+        let mut server = compat_session(&mut stack);
+        stack.peers[0].flush = false;
+        stack.peers[0].endpoint.keepalive = None;
+        let data = build_ipv4_udp(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 66, 66, 2),
+            456,
+            123,
+            b"data",
+        );
+        let encrypted = server.seal(&data).unwrap();
+        let index = stack.peers[0].session.as_ref().unwrap().local_index;
+        stack.on_transport(&encrypted, index, stack.peers[0].resolved.unwrap());
+        let due = stack.peers[0].reactive_keepalive.unwrap();
+        assert!(due.duration_since(Instant::now()) > Duration::from_secs(29));
+        assert!(stack.next_deadline().into_std() <= due);
+        stack.peers[0].reactive_keepalive = Some(Instant::now() - Duration::from_millis(1));
+        stack.maintain_peers().await;
+        assert!(stack.peers[0].reactive_keepalive.is_none());
+        assert!(stack.peers[0].last_sent.is_some());
+        stack.peers[0].received_data(Instant::now(), Duration::from_secs(30));
+        stack.seal_transport(0, &data).unwrap();
+        assert!(stack.peers[0].reactive_keepalive.is_none());
+    }
+
+    #[tokio::test]
+    async fn awg_compat_plain_wg_transport_and_retry_remain_legacy() {
+        let (mut stack, _sink) = compat_stack(json!({})).await;
+        let mut server = compat_session(&mut stack);
+        let data = build_ipv4_udp(
+            Ipv4Addr::new(10, 66, 66, 2),
+            Ipv4Addr::new(10, 66, 66, 1),
+            123,
+            456,
+            b"legacy",
+        );
+        let wire = stack.seal_transport(0, &data).unwrap();
+        assert_eq!(wire.len(), 32 + data.len().next_multiple_of(16));
+        assert_eq!(noise::trim_ip_padding(&server.open(&wire).unwrap()), data);
+        assert_eq!(stack.handshake_timeout(), REKEY_TIMEOUT);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn awg_compat_control_class_restores_socket_before_data() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = UdpSocket::bind(bind).await.unwrap();
+            let sink = UdpSocket::bind(bind).await.unwrap();
+            socket.writable().await.unwrap();
+            let addr = sink.local_addr().unwrap();
+            let sr = socket2::SockRef::from(&socket);
+            if addr.is_ipv4() {
+                sr.set_tos_v4(0x20).unwrap();
+            } else {
+                sr.set_tclass_v6(0x20).unwrap();
+            }
+            assert_eq!(send_control(&socket, b"handshake", addr, 0x88).unwrap(), 9);
+            assert_eq!(
+                if addr.is_ipv4() {
+                    sr.tos_v4().unwrap()
+                } else {
+                    sr.tclass_v6().unwrap()
+                },
+                0x20
+            );
+            let mut bytes = [0; 32];
+            let (n, _) = sink.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[..n], b"handshake");
+        }
+    }
 
     #[test]
     fn receive_tokens_recycle_packet_buffers_without_exceeding_pool_bound() {
