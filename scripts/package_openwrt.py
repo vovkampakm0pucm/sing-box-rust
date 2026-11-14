@@ -111,7 +111,7 @@ def main():
                         configuration_baseline='1.14.2', packed=False)
         files = [('usr/bin/sing-box', binary, 0o755),
                  ('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644)]
-        for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:
+        for path in ['etc/init.d/sing-box', 'etc/config/sing-box', 'etc/singbox/config.json']:
             files.append((path, (ROOT/'packaging/files'/path).read_bytes(), 0o755 if 'init.d' in path else 0o644))
         size = sum(len(data) for _, data, _ in files)
         control = f'''Package: rust-x
@@ -129,7 +129,7 @@ Description: Xrust router core for Forkop
 '''
         ipk = a.output/f'rust-x_{a.version}-{a.revision}_{arch}.ipk'
         ipk.write_bytes(tar_bytes([('debian-binary', b'2.0\n', 0o644),
-            ('control.tar.gz', tar_bytes([('control', control.encode(), 0o644), ('conffiles', b'/etc/config/sing-box\n', 0o644), ('prerm', NATIVE_STOP, 0o755), ('postinst', NATIVE_START, 0o755)]), 0o644),
+            ('control.tar.gz', tar_bytes([('control', control.encode(), 0o644), ('conffiles', b'/etc/config/sing-box\n/etc/singbox/config.json\n', 0o644), ('prerm', NATIVE_STOP, 0o755), ('postinst', NATIVE_START, 0o755)]), 0o644),
             ('data.tar.gz', tar_bytes(files), 0o644)]))
         apk = a.output/f'rust-x_{a.version}-r{a.revision}_{arch}.apk'
         with tempfile.TemporaryDirectory(prefix='rust-x-package-') as temp:
@@ -139,7 +139,7 @@ Description: Xrust router core for Forkop
             meta = payload/'lib/apk/packages'; meta.mkdir(parents=True)
             (meta/'rust-x.list').write_text(''.join('/'+n+'\n' for n, _, _ in files))
             for suffix in ['conffiles', 'conffiles_static']:
-                (meta/f'rust-x.{suffix}').write_text('/etc/config/sing-box\n')
+                (meta/f'rust-x.{suffix}').write_text('/etc/config/sing-box\n/etc/singbox/config.json\n')
             for f in [payload, *payload.rglob('*')]:
                 if f.is_dir(): f.chmod(0o755)
                 elif f.parent == meta: f.chmod(0o644)
