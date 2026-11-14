@@ -111,8 +111,10 @@ def main():
                         configuration_baseline='1.14.2', packed=False)
         files = [('usr/bin/sing-box', binary, 0o755),
                  ('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644)]
-        for path in ['etc/init.d/sing-box', 'etc/config/sing-box', 'etc/sing-box/config.json']:
+        for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:
             files.append((path, (ROOT/'packaging/files'/path).read_bytes(), 0o755 if 'init.d' in path else 0o644))
+        cfg_file = ROOT/'packaging/files/etc/sing-box/config.json'
+        files.append(('etc/sing-box/config.json', cfg_file.read_bytes() if cfg_file.exists() else b'{}\n', 0o644))
         size = sum(len(data) for _, data, _ in files)
         control = f'''Package: rust-x
 Version: {a.version}-{a.revision}
