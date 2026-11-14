@@ -109,12 +109,7 @@ def main():
                         architecture=arch, source_commit=a.source_commit,
                         binary_bytes=len(binary), binary_sha256=hashlib.sha256(binary).hexdigest(),
                         configuration_baseline='1.14.2', packed=False)
-        # The binary, installed under the sing-box name, prints the version
-        # block Forkop X reads itself.
-        wrapper = b'''#!/bin/sh
-exec /usr/lib/rust-x/sing-box "$@"
-'''
-        files = [('usr/lib/rust-x/sing-box', binary, 0o755), ('usr/bin/sing-box', wrapper, 0o755),
+        files = [('usr/bin/sing-box', binary, 0o755),
                  ('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644)]
         for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:
             files.append((path, (ROOT/'packaging/files'/path).read_bytes(), 0o755 if 'init.d' in path else 0o644))
@@ -129,7 +124,7 @@ Provides: sing-box
 Section: net
 License: GPL-3.0-only
 Maintainer: Screamshow
-Source: https://github.com/Screamshow/xrust
+Source: https://github.com
 Description: Xrust router core for Forkop
 '''
         ipk = a.output/f'rust-x_{a.version}-{a.revision}_{arch}.ipk'
@@ -157,7 +152,7 @@ Description: Xrust router core for Forkop
                 cmd += ['-s', f'{hook}:{script}']
             fields = dict(name='rust-x', version=f'{a.version}-r{a.revision}', arch=arch,
                           description='Xrust router core for Forkop', license='GPL-3.0-only',
-                          origin='rust-x', maintainer='Screamshow', url='https://github.com/Screamshow/xrust',
+                          origin='rust-x', maintainer='Screamshow', url='https://github.com',
                           depends=' '.join(dependencies + ['!'+c for c in CONFLICTS]), provides='sing-box')
             for key, value in fields.items(): cmd += ['-I', f'{key}:{value}']
             if os.geteuid() == 0:
