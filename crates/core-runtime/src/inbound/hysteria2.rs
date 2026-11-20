@@ -12,16 +12,14 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::tls::ServerTls;
-use super::udp::{DatagramFrame, Reply, TunReply, UdpHub};
+use super::udp::{DatagramFrame, Hy2Reply, Reply, UdpHub};
 use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::hysteria2::{
-    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, next_packet_id, pack_hy2, parse_hy2_packet,
-    read_exact_vec, read_varint_stream,
+    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, MAX_PADDING, parse_hy2_packet,
+    read_bounded_length, read_exact_vec, read_varint_stream, send_hy2_datagram,
 };
-use crate::outbound::quic::{
-    Defragger, QuicStream, SalamanderRelay, salamander_open, salamander_seal,
-};
+use crate::outbound::quic::{Defragger, QuicStream, SalamanderSocket};
 use crate::route::Router;
 
 const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,7 +32,6 @@ pub struct Hysteria2 {
     users: Arc<HashMap<String, String>>, // password -> username
     hub: Arc<UdpHub>,
     local_addr: SocketAddr,
-    _relay: Option<SalamanderRelay>,
 }
 
 impl Hysteria2 {
@@ -99,79 +96,21 @@ impl Hysteria2 {
         let runtime =
             quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("{at}: no quinn runtime"))?;
 
-        let (endpoint, local_addr, relay) = if let Some(pw) = obfs_password {
-            // Bind loopback socket for Quinn
-            let ep_bind = if addr.is_ipv4() {
-                "127.0.0.1:0"
-            } else {
-                "[::1]:0"
-            };
-            let ep_sock = std::net::UdpSocket::bind(ep_bind)?;
-            let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let ep_config =
+            quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9u8; 32])));
+        let endpoint = if let Some(password) = obfs_password {
+            let socket = SalamanderSocket::listen(&*runtime, socket, password)?;
+            quinn::Endpoint::new_with_abstract_socket(
+                ep_config,
                 Some(server_config),
-                ep_sock,
+                Arc::new(socket),
                 runtime,
-            )?;
-            let ep_local = ep.local_addr()?;
-
-            // Public listening socket with salamander obfs
-            let public_sock = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
-            let actual_local = public_sock.local_addr()?;
-            let loop_sock = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
-            loop_sock.connect(ep_local).await?;
-
-            let pw_in = pw.clone();
-            let pub_in = Arc::clone(&public_sock);
-            let loop_in = Arc::clone(&loop_sock);
-            let in_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let (n, _peer) = match pub_in.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    if let Some(plain) = salamander_open(&pw_in, &buf[..n]) {
-                        let _ = loop_in.send(&plain).await;
-                    }
-                }
-            });
-
-            let pw_out = pw;
-            let pub_out = Arc::clone(&public_sock);
-            let loop_out = Arc::clone(&loop_sock);
-            let out_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let n = match loop_out.recv(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let sealed = salamander_seal(&pw_out, &buf[..n]);
-                    let _ = pub_out.send(&sealed).await;
-                }
-            });
-
-            let relay = SalamanderRelay {
-                local: actual_local,
-                handles: vec![in_task, out_task],
-            };
-            (ep, actual_local, Some(relay))
+            )?
         } else {
-            let sock = std::net::UdpSocket::bind(addr)?;
-            let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
-                Some(server_config),
-                sock,
-                runtime,
-            )?;
-            let local = ep.local_addr()?;
-            (ep, local, None)
+            quinn::Endpoint::new(ep_config, Some(server_config), socket, runtime)?
         };
+        let local_addr = endpoint.local_addr()?;
 
         let hub = UdpHub::new(Arc::clone(&router), DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw);
 
@@ -182,7 +121,6 @@ impl Hysteria2 {
             users: Arc::new(users),
             hub,
             local_addr,
-            _relay: relay,
         })
     }
 
@@ -197,7 +135,10 @@ impl Hysteria2 {
             self.local_addr
         ));
 
+        let mut next_connection_id = 0_u64;
         while let Some(incoming) = self.endpoint.accept().await {
+            let connection_id = next_connection_id;
+            next_connection_id = next_connection_id.wrapping_add(1);
             let router = Arc::clone(&self.router);
             let users = Arc::clone(&self.users);
             let hub = Arc::clone(&self.hub);
@@ -212,7 +153,8 @@ impl Hysteria2 {
                         return;
                     }
                 };
-                handle_hy2_connection(conn, router, users, hub, tag, local_addr).await;
+                handle_hy2_connection(conn, connection_id, router, users, hub, tag, local_addr)
+                    .await;
             });
         }
     }
@@ -220,6 +162,7 @@ impl Hysteria2 {
 
 async fn handle_hy2_connection(
     conn: quinn::Connection,
+    connection_id: u64,
     router: Arc<Router>,
     users: Arc<HashMap<String, String>>,
     hub: Arc<UdpHub>,
@@ -248,18 +191,21 @@ async fn handle_hy2_connection(
         "hysteria2[{tag}] {peer} authenticated as {user_name}"
     ));
 
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<TunReply>(128);
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<Hy2Reply>(128);
 
     // UDP reply sender back to QUIC datagrams
     let conn_udp_send = conn.clone();
-    let packet_counter = Arc::new(AtomicU32::new(0));
-    let packet_counter_clone = Arc::clone(&packet_counter);
     let reply_handle = tokio::spawn(async move {
+        let packet_counter = AtomicU32::new(0);
         while let Some(reply) = reply_rx.recv().await {
-            let pid = next_packet_id(&packet_counter_clone);
             let src_str = reply.src.to_string();
-            let pkt = pack_hy2(0, pid, 0, 1, &src_str, &reply.payload);
-            let _ = conn_udp_send.send_datagram(pkt.into());
+            let _ = send_hy2_datagram(
+                &conn_udp_send,
+                reply.session_id,
+                &src_str,
+                &reply.payload,
+                &packet_counter,
+            );
         }
     });
 
@@ -285,13 +231,10 @@ async fn handle_hy2_connection(
                 if frame_type != FRAME_TCP_REQUEST {
                     return;
                 }
-                let dest_len = match read_varint_stream(&mut recv).await {
-                    Ok(v) => v as usize,
-                    Err(_) => return,
+                let dest_len = match read_bounded_length(&mut recv, MAX_ADDRESS, "address").await {
+                    Ok(len) if len > 0 => len,
+                    _ => return,
                 };
-                if dest_len > MAX_ADDRESS {
-                    return;
-                }
                 let dest_bytes = match read_exact_vec(&mut recv, dest_len).await {
                     Ok(b) => b,
                     Err(_) => return,
@@ -300,8 +243,8 @@ async fn handle_hy2_connection(
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let pad_len = match read_varint_stream(&mut recv).await {
-                    Ok(v) => v as usize,
+                let pad_len = match read_bounded_length(&mut recv, MAX_PADDING, "padding").await {
+                    Ok(len) => len,
                     Err(_) => return,
                 };
                 let _pad = match read_exact_vec(&mut recv, pad_len).await {
@@ -330,28 +273,26 @@ async fn handle_hy2_connection(
 
     // Accept datagrams (UDP)
     let conn_dg = conn.clone();
-    let defragger = Arc::new(std::sync::Mutex::new(Defragger::new()));
     let hub_dg = Arc::clone(&hub);
     let tag_dg = tag.clone();
     let dg_handle = tokio::spawn(async move {
+        let mut defragger = Defragger::new();
         loop {
             let data = match conn_dg.read_datagram().await {
                 Ok(d) => d,
                 Err(_) => break,
             };
-            let Some((_sid, pid, frag_id, frag_total, dest, payload)) = parse_hy2_packet(&data)
+            let Some((session_id, pid, frag_id, frag_total, dest, payload)) =
+                parse_hy2_packet(&data)
             else {
                 continue;
             };
-            let complete = {
-                let mut defrag = defragger.lock().expect("defragger");
-                defrag.feed(
-                    pid,
-                    frag_id,
-                    frag_total,
-                    bytes::Bytes::copy_from_slice(payload),
-                )
-            };
+            let complete = defragger.feed(
+                (session_id, pid),
+                frag_id,
+                frag_total,
+                bytes::Bytes::copy_from_slice(payload),
+            );
             if let Some(pkt) = complete {
                 let target = match parse_target_str(dest) {
                     Some(t) => t,
@@ -368,7 +309,9 @@ async fn handle_hy2_connection(
                 };
                 let _ = hub_dg
                     .handle(
-                        Reply::Tun {
+                        Reply::Hy2 {
+                            connection_id,
+                            session_id,
                             sender: reply_tx.clone(),
                         },
                         peer,

@@ -14,6 +14,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use serde_json::Value;
 use sha1::Digest as _;
@@ -85,9 +86,9 @@ enum Kind {
         /// `max_early_data`: bytes of the first write that ride in the upgrade
         /// request instead of a websocket frame
         max_early_data: usize,
-        /// `early_data_header_name`: the header that carries the early data;
-        /// empty means `Sec-WebSocket-Protocol` (not sing-box's path mode)
-        early_data_header_name: String,
+        /// None appends early data to the path. An empty header name uses
+        /// Sec-WebSocket-Protocol, as in Xray.
+        early_data_header_name: Option<String>,
     },
     HttpUpgrade {
         path: String,
@@ -96,6 +97,8 @@ enum Kind {
     },
     Grpc {
         service_name: String,
+        multi_mode: bool,
+        keep_alive: Option<h2io::H2KeepAlive>,
     },
     Http {
         host: Vec<String>,
@@ -232,27 +235,41 @@ impl Transport {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("{at}: transport missing type"))?;
         let kind = match ty {
-            "ws" => Kind::Ws {
-                path: transport
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("/")
-                    .to_string(),
-                host: transport
-                    .get("host")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                headers: parse_headers(transport.get("headers"), at)?,
-                max_early_data: transport
-                    .get("max_early_data")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize,
-                early_data_header_name: transport
+            "ws" => {
+                let header_name = transport
                     .get("early_data_header_name")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
+                    .unwrap_or("");
+                let in_path = match transport.get("early_data_in_path") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(enabled)) => *enabled,
+                    Some(_) => {
+                        anyhow::bail!("{at}.transport.early_data_in_path: expected a boolean")
+                    }
+                };
+                if in_path && !header_name.is_empty() {
+                    anyhow::bail!(
+                        "{at}.transport: early_data_in_path conflicts with early_data_header_name"
+                    );
+                }
+                Kind::Ws {
+                    path: transport
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/")
+                        .to_string(),
+                    host: transport
+                        .get("host")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    headers: parse_headers(transport.get("headers"), at)?,
+                    max_early_data: transport
+                        .get("max_early_data")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    early_data_header_name: (!in_path).then(|| header_name.to_string()),
+                }
+            }
             "httpupgrade" => Kind::HttpUpgrade {
                 path: transport
                     .get("path")
@@ -265,16 +282,19 @@ impl Transport {
                     .map(str::to_string),
                 headers: parse_headers(transport.get("headers"), at)?,
             },
-            "grpc" => {
-                warn_unimplemented_grpc_fields(transport, at);
-                Kind::Grpc {
-                    service_name: transport
-                        .get("service_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                }
-            }
+            "grpc" => Kind::Grpc {
+                service_name: transport
+                    .get("service_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                multi_mode: match transport.get("multi_mode") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(enabled)) => *enabled,
+                    Some(_) => anyhow::bail!("{at}.transport.multi_mode: expected a boolean"),
+                },
+                keep_alive: grpc_keep_alive(transport, at)?,
+            },
             "http" => {
                 warn_unimplemented_http_fields(transport, at);
                 let mut method = transport
@@ -383,6 +403,10 @@ impl Transport {
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<AnyStream> {
         if let Kind::Xhttp(cfg) = &self.kind {
+            if cfg.has_download_settings() {
+                let dialer = self.dialer(tls, server, port, dial);
+                return cfg.connect_split(tls, server, port, dial, dialer).await;
+            }
             match cfg.connect_h2_stream(tls, server, port, dial).await? {
                 xhttp::H2Connect::Stream(stream) => return Ok(stream),
                 xhttp::H2Connect::Fallback(stream) => {
@@ -479,15 +503,14 @@ impl Transport {
                     .finish_dial(Some(send_request.clone()), max_conns)
                     .await
                     .expect("counter present");
+                let keep_alive = match &self.kind {
+                    Kind::Grpc { keep_alive, .. } => *keep_alive,
+                    _ => None,
+                };
                 tokio::spawn(h2io::drive_h2_connection(
                     connection,
                     clock,
-                    // No PINGs: Xray's gRPC dialer hands grpc-go keepalive
-                    // parameters only when the config asks for them, and its
-                    // HTTP/2 transport leaves `ReadIdleTimeout` unset. A
-                    // connection nobody can use is dropped when a stream
-                    // fails on it, and an unused one on the idle close below.
-                    None,
+                    keep_alive,
                     std::sync::Arc::downgrade(&self.h2_pool),
                     counter.clone(),
                     self.h2_idle,
@@ -552,7 +575,11 @@ impl Transport {
         server: &str,
     ) -> io::Result<AnyStream> {
         match &self.kind {
-            Kind::Grpc { service_name } => {
+            Kind::Grpc {
+                service_name,
+                multi_mode,
+                ..
+            } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`).
@@ -560,7 +587,7 @@ impl Transport {
                     .map(TlsOptions::server_name)
                     .filter(|name| !name.is_empty())
                     .unwrap_or(server);
-                grpc::open_pooled(&mut send_req, service_name, sni)
+                grpc::open_pooled(&mut send_req, service_name, sni, *multi_mode)
             }
             Kind::Http {
                 host,
@@ -623,7 +650,7 @@ impl Transport {
                 } else {
                     let no_early = EarlyData {
                         max: 0,
-                        header_name: early_data_header_name,
+                        header_name: early_data_header_name.as_deref(),
                     };
                     ws_handshake(stream, path, host, headers, &[], no_early)
                         .await?
@@ -641,7 +668,11 @@ impl Transport {
                     .unwrap_or(server);
                 httpupgrade_handshake(stream, path, host, headers).await?
             }
-            Kind::Grpc { service_name } => {
+            Kind::Grpc {
+                service_name,
+                multi_mode,
+                ..
+            } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`); ours used to send
@@ -650,7 +681,7 @@ impl Transport {
                     .map(TlsOptions::server_name)
                     .filter(|name| !name.is_empty())
                     .unwrap_or(server);
-                grpc::connect(stream, service_name, sni).await?
+                grpc::connect(stream, service_name, sni, *multi_mode).await?
             }
             Kind::Http {
                 host,
@@ -723,17 +754,70 @@ impl Transport {
     }
 }
 
-/// `transport.grpc` keepalive knobs: the h2 layer does not send PINGs yet, so
-/// the values are parsed (validating the duration) and reported as a gap.
-fn warn_unimplemented_grpc_fields(transport: &serde_json::Map<String, Value>, at: &str) {
-    let mut warned = false;
-    for key in ["idle_timeout", "ping_timeout", "permit_without_stream"] {
-        if transport.contains_key(key) && !warned {
-            crate::logging::warn(format_args!(
-                "{at}: transport grpc keepalive options are not implemented yet; ignoring"
-            ));
-            warned = true;
+fn grpc_keep_alive(
+    transport: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<Option<h2io::H2KeepAlive>> {
+    let duration = |key| {
+        let value = transport.get(key);
+        let at = format!("{at}.transport.{key}");
+        if let Some(magnitude) = value
+            .and_then(Value::as_str)
+            .and_then(|s| s.strip_prefix('-'))
+        {
+            // Nonpositive durations are treated as unset, as in Xray.
+            let magnitude = Value::String(magnitude.to_owned());
+            crate::outbound::urltest::parse_duration(Some(&magnitude), Duration::ZERO, &at)?;
+            Ok(Duration::ZERO)
+        } else {
+            crate::outbound::urltest::parse_duration(value, Duration::ZERO, &at)
         }
+    };
+    let period = duration("idle_timeout")?;
+    let timeout = duration("ping_timeout")?;
+    let permit_without_stream = transport
+        .get("permit_without_stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if period.is_zero() && timeout.is_zero() && !permit_without_stream {
+        return Ok(None);
+    }
+    // Xray enables grpc-go keepalive only on request, with a 10 s minimum
+    // period and a 20 s wait for an ACK when no timeout is set.
+    Ok(Some(h2io::H2KeepAlive {
+        period: period.max(Duration::from_secs(10)),
+        timeout: if timeout.is_zero() {
+            Duration::from_secs(20)
+        } else {
+            timeout
+        },
+        permit_without_stream,
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn grpc_keep_alive_uses_xray_defaults_only_on_request() {
+    use serde_json::json;
+    for (options, expected) in [
+        (json!({}), None),
+        (json!({"idle_timeout": "0s", "ping_timeout": "-1s"}), None),
+        (json!({"idle_timeout": "30s"}), Some((30, 20, false))),
+        (
+            json!({"idle_timeout": "1s", "ping_timeout": "2s"}),
+            Some((10, 2, false)),
+        ),
+        (json!({"permit_without_stream": true}), Some((10, 20, true))),
+    ] {
+        let actual = grpc_keep_alive(options.as_object().unwrap(), "test").unwrap();
+        assert_eq!(
+            actual.map(|k| (
+                k.period.as_secs(),
+                k.timeout.as_secs(),
+                k.permit_without_stream
+            )),
+            expected
+        );
     }
 }
 
@@ -789,7 +873,7 @@ fn has_header(headers: &[(String, String)], name: &str) -> bool {
 /// The ws early data settings of one outbound.
 struct EarlyData<'a> {
     max: usize,
-    header_name: &'a str,
+    header_name: Option<&'a str>,
 }
 
 /// Websocket upgrade. When `max_early_data` is set the first bytes of the
@@ -797,15 +881,8 @@ struct EarlyData<'a> {
 /// server still answers 101 and everything after it is normal framing.
 /// Returns how many bytes of `early` were consumed.
 ///
-/// Up to `max_early_data` bytes go base64url without padding (what both
-/// sing-box and Xray decode) in the header named by `early_data_header_name`,
-/// or in `Sec-WebSocket-Protocol` when that is empty, as Xray sends it.
-/// This differs from sing-box on purpose: there an empty name appends the
-/// early data to the path, which an Xray server rejects as a wrong path, and
-/// Forkop X writes `ed=` links with no header name for Xray servers.
-///
-/// `LazyWs` hands this the whole first write or nothing; a longer `early` is
-/// cut at `max_early_data` and the caller sends the rest as a frame.
+/// Early data is base64url without padding. Path mode appends it before the
+/// query string. Header mode defaults to Sec-WebSocket-Protocol for Xray links.
 async fn ws_handshake(
     mut stream: AnyStream,
     path: &str,
@@ -826,11 +903,13 @@ async fn ws_handshake(
     } else {
         String::new()
     };
-    let header_name = if early_data.header_name.is_empty() {
-        "Sec-WebSocket-Protocol"
-    } else {
-        early_data.header_name
-    };
+    let header_name = early_data.header_name.map(|name| {
+        if name.is_empty() {
+            "Sec-WebSocket-Protocol"
+        } else {
+            name
+        }
+    });
     // With no `User-Agent` configured the upgrade request is dressed as a
     // browser making a websocket request, as Xray's dialer does
     // (`websocket/config.go` GetRequestHeader -> `TryDefaultHeadersWith(.., "ws")`).
@@ -839,19 +918,29 @@ async fn ws_handshake(
         560 + path.len() + host.len() + key.len() + headers.len() * 48 + encoded.len(),
     );
     request.push_str("GET ");
-    request.push_str(path);
+    if header_name.is_none() {
+        let path_end = path.find('?').unwrap_or(path.len());
+        if !path.starts_with('/') {
+            request.push('/');
+        }
+        request.push_str(&path[..path_end]);
+        request.push_str(&encoded);
+        request.push_str(&path[path_end..]);
+    } else {
+        request.push_str(path);
+    }
     request.push_str(" HTTP/1.1\r\nHost: ");
     request.push_str(host);
     request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
     request.push_str(&key);
     request.push_str("\r\nSec-WebSocket-Version: 13\r\n");
     // the early data replaces a configured header of the same name
-    let in_header = carried > 0;
+    let early_header = header_name.filter(|_| carried > 0);
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
-        if in_header && name.eq_ignore_ascii_case(header_name) {
+        if early_header.is_some_and(|header| name.eq_ignore_ascii_case(header)) {
             continue;
         }
         if browser.replaces(name)
@@ -872,7 +961,7 @@ async fn ws_handshake(
             push_header(&mut request, browser::h1_name(name), value);
         }
     }
-    if in_header {
+    if let Some(header_name) = early_header {
         push_header(&mut request, header_name, &encoded);
     }
     request.push_str("\r\n");
@@ -902,7 +991,7 @@ struct WsRequest {
     host: String,
     headers: Vec<(String, String)>,
     max_early_data: usize,
-    early_data_header_name: String,
+    early_data_header_name: Option<String>,
 }
 
 type Upgrade = Pin<Box<dyn Future<Output = io::Result<(AnyStream, usize)>> + Send>>;
@@ -918,10 +1007,8 @@ enum Lazy {
 
 /// A ws connection with early data, opened the way both references open it:
 /// the upgrade request goes out with the first write and carries it when it
-/// fits in `max_early_data` (Xray `delayDialConn`, `websocket/dialer.go`;
-/// sing-box `EarlyWebsocketConn`, `transport/v2raywebsocket/conn.go`, which
-/// also sends the first `max_early_data` bytes of a longer write early). The protocol head waits for the
-/// first payload above this, so the upgrade request carries both, and for a
+/// fits in the early data budget.
+/// The protocol head waits for the first payload above this, and for a
 /// destination that talks first it carries the head alone once the wait is
 /// over. TCP and TLS are connected up front, as sing-box does, so a dead
 /// server still fails the dial rather than the first write.
@@ -1005,11 +1092,8 @@ impl AsyncWrite for LazyWs {
             else {
                 unreachable!()
             };
-            // all of the first write or none of it, as Xray's client does: a
-            // server reading the protocol head from the first read alone gets
-            // a cut-off head from a split one (Xray's trojan inbound takes
-            // anything under 58 bytes for a fallback), so a longer write goes
-            // as a normal frame after a plain upgrade
+            // Trojan servers can reject a split initial request. If the
+            // write exceeds the budget, send it in a normal frame instead.
             let early = if buf.len() <= request.max_early_data {
                 buf.to_vec()
             } else {
@@ -1018,7 +1102,7 @@ impl AsyncWrite for LazyWs {
             this.state = Lazy::Upgrading(Box::pin(async move {
                 let early_data = EarlyData {
                     max: request.max_early_data,
-                    header_name: &request.early_data_header_name,
+                    header_name: request.early_data_header_name.as_deref(),
                 };
                 ws_handshake(
                     stream,

@@ -238,18 +238,9 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "http",
     "tun",
     "vless",
-    "vmess",
-    "trojan",
-    "shadowsocks",
-    "anytls",
     "hysteria2",
-    "tuic",
-    "shadowtls",
-    "naive",
     "hysteria",
-    "snell",
     "cloudflared",
-    "fptn",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -257,25 +248,16 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
     "block",
     "selector",
     "urltest",
-    "socks",
     "http",
-    "shadowsocks",
-    "shadowtls",
-    "vmess",
     "vless",
     "trojan",
     "hysteria2",
     "hysteria",
-    "tuic",
-    "anytls",
     "chain",
     "masque",
-    "naive",
     "tor",
     "ssh",
-    "snell",
     "wireguard",
-    "fptn",
     "dns",
     "bridge",
 ];
@@ -960,6 +942,7 @@ const TLS_OUT_FIELDS: &[&str] = &[
     "engine",
     "disable_sni",
     "server_name",
+    "verify_server_name",
     "insecure",
     "alpn",
     "min_version",
@@ -970,6 +953,7 @@ const TLS_OUT_FIELDS: &[&str] = &[
     "certificate_path",
     "certificate_public_key_sha256",
     "certificate_sha256",
+    "xray_pinned_peer_cert_sha256",
     "client_certificate",
     "client_certificate_path",
     "client_key",
@@ -2055,6 +2039,9 @@ fn validate_tls_container(value: &Value, at: &str, inbound: bool) -> Result<(), 
     if !value.is_object() {
         return Ok(());
     }
+    if !inbound {
+        check_xray_tls_verification(value, at)?;
+    }
     // reference stage-2 prune runs deep inside the container: `{}`/`[]`
     // (including nested empties) behave as absent fields.
     let Some(value) = deep_prune(value) else {
@@ -2143,6 +2130,59 @@ fn validate_tls_container(value: &Value, at: &str, inbound: bool) -> Result<(), 
         }
     }
     reject_unknown_fields_deep(&value, at, allowed)?;
+    Ok(())
+}
+
+fn check_xray_tls_verification(value: &Value, at: &str) -> Result<(), String> {
+    let verify_name = value.get("verify_server_name");
+    let pins = value.get("xray_pinned_peer_cert_sha256");
+    if (pins.is_some() || verify_name.is_some())
+        && value.pointer("/reality/enabled").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(format!(
+            "{at}: Xray TLS certificate verification is not applicable to REALITY"
+        ));
+    }
+    if pins.is_some()
+        && ["certificate_sha256", "certificate_public_key_sha256"]
+            .iter()
+            .any(|field| value.get(field).and_then(deep_prune).is_some())
+    {
+        return Err(format!(
+            "{at}.xray_pinned_peer_cert_sha256 cannot be combined with native pins"
+        ));
+    }
+
+    for (field, setting) in [
+        ("verify_server_name", verify_name),
+        ("xray_pinned_peer_cert_sha256", pins),
+    ] {
+        let Some(setting) = setting else { continue };
+        let items = setting
+            .as_array()
+            .map_or_else(|| std::slice::from_ref(setting), Vec::as_slice);
+        if items.is_empty() {
+            return Err(format!("{at}.{field} cannot be empty"));
+        }
+        for item in items {
+            let text = item.as_str().unwrap_or("").trim();
+            if text.is_empty() {
+                return Err(format!("{at}.{field} must contain nonempty strings"));
+            }
+            if field == "xray_pinned_peer_cert_sha256" {
+                use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+                if !STANDARD
+                    .decode(text)
+                    .or_else(|_| STANDARD_NO_PAD.decode(text))
+                    .is_ok_and(|raw| raw.len() == 32)
+                {
+                    return Err(format!(
+                        "{at}.{field} must contain Base64 SHA-256 fingerprints"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3845,11 +3885,17 @@ pub fn validate(root: &Value) -> Result<(), String> {
         for (i, raw) in entries.iter().enumerate() {
             // reference stage-2 prune runs before every option decode: empty
             // containers behave as absent (whole entries keep their shape).
-            let entry = if raw.is_object() {
+            let mut entry = if raw.is_object() {
                 deep_prune(raw).unwrap_or_else(|| Value::Object(Map::new()))
             } else {
                 raw.clone()
             };
+            // An explicit XHTTP download must be validated even when empty.
+            if raw.pointer("/transport/type").and_then(Value::as_str) == Some("xhttp")
+                && let Some(download) = raw.pointer("/transport/download_settings")
+            {
+                entry["transport"]["download_settings"] = download.clone();
+            }
             let entry = &entry;
             let obj = object_entry(entry, &format!("outbounds[{i}]"))?;
             let ty = type_field(obj, &format!("outbounds[{i}]"))?;
@@ -4905,11 +4951,13 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
         "headers",
         "max_early_data",
         "early_data_header_name",
+        "early_data_in_path",
     ];
     const QUIC: &[&str] = &["type"];
     const GRPC: &[&str] = &[
         "type",
         "service_name",
+        "multi_mode",
         "idle_timeout",
         "ping_timeout",
         "permit_without_stream",
@@ -4948,6 +4996,23 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
                     check_string_field(v, &format!("{at}.{f}"), "V2RayWebsocketOptions", f)?;
                 }
             }
+            if let Some(v) = t.get("early_data_in_path") {
+                check_bool_field(
+                    v,
+                    &format!("{at}.early_data_in_path"),
+                    "V2RayWebsocketOptions",
+                    "early_data_in_path",
+                )?;
+                if v == &Value::Bool(true)
+                    && t.get("early_data_header_name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    return Err(format!(
+                        "{at}: early_data_in_path conflicts with early_data_header_name"
+                    ));
+                }
+            }
             if let Some(v) = t.get("max_early_data") {
                 check_uint_field(
                     v,
@@ -4980,13 +5045,10 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
                     check_duration_field(v, &format!("{at}.{f}"), "V2RayGRPCOptions", f)?;
                 }
             }
-            if let Some(v) = t.get("permit_without_stream") {
-                ep_bool(
-                    v,
-                    &format!("{at}.permit_without_stream"),
-                    "V2RayGRPCOptions",
-                    "permit_without_stream",
-                )?;
+            for field in ["permit_without_stream", "multi_mode"] {
+                if let Some(v) = t.get(field) {
+                    ep_bool(v, &format!("{at}.{field}"), "V2RayGRPCOptions", field)?;
+                }
             }
         }
         "httpupgrade" => {
@@ -5072,6 +5134,7 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
         "no_sse_header",
         "sc_max_buffered_posts",
         "sc_stream_up_server_secs",
+        "download_settings",
     ];
     for k in t.keys() {
         if !KNOWN.contains(&k.as_str()) {
@@ -5082,6 +5145,14 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
     match mode {
         "" | "auto" | "packet-up" | "stream-up" | "stream-one" => {}
         other => return Err(format!("v2ray-xhttp: unknown mode: {other}")),
+    }
+    if let Some(value) = t.get("download_settings") {
+        if mode == "stream-one" {
+            return Err(format!(
+                "{at}.download_settings: stream-one has no separate download"
+            ));
+        }
+        validate_xhttp_download_settings(value, &format!("{at}.download_settings"))?;
     }
     for f in [
         "host",
@@ -5381,6 +5452,48 @@ fn validate_trojan_client(i: usize, obj: &Map<String, Value>) -> Result<(), Stri
 }
 
 /// Listable[string] → joined content (reference `strings.Join(list, "\n")`).
+fn validate_xhttp_download_settings(value: &Value, at: &str) -> Result<(), String> {
+    let settings = value
+        .as_object()
+        .ok_or_else(|| format!("{at}: expected an object"))?;
+    for key in settings.keys() {
+        if !matches!(key.as_str(), "server" | "server_port" | "tls" | "transport") {
+            return Err(format!("{at}.{key}: json: unknown field \"{key}\""));
+        }
+    }
+    if !settings
+        .get("server")
+        .and_then(Value::as_str)
+        .is_some_and(|server| !server.trim().is_empty())
+    {
+        return Err(format!("{at}.server: expected a nonempty server address"));
+    }
+    if !settings
+        .get("server_port")
+        .and_then(Value::as_u64)
+        .is_some_and(|port| (1..=u16::MAX as u64).contains(&port))
+    {
+        return Err(format!("{at}.server_port: expected a port from 1 to 65535"));
+    }
+    if let Some(tls) = settings.get("tls") {
+        validate_tls_container(tls, &format!("{at}.tls"), false)?;
+        validate_utls_reality(tls, at)?;
+    }
+    let transport = settings
+        .get("transport")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{at}.transport: expected an XHTTP transport object"))?;
+    if transport.get("type").and_then(Value::as_str) != Some("xhttp") {
+        return Err(format!("{at}.transport.type: expected xhttp"));
+    }
+    if transport.contains_key("download_settings") {
+        return Err(format!(
+            "{at}.transport.download_settings: nested downloads are unsupported"
+        ));
+    }
+    validate_xhttp_transport(transport, &format!("{at}.transport"))
+}
+
 fn tls_listable_join(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(s)) => s.clone(),
@@ -7766,99 +7879,10 @@ fn go_b64_rawurl_decoded_len(s: &str) -> usize {
     }
 }
 
-/// reference `option.AWGRange` decode (`normalizeAWGRange`): canonical
-/// `"N"` / `"N-M"` string, `""` when unset. Errors mirror
-/// `AWGRange.UnmarshalJSON` / `normalizeAWGRange`.
-fn awg_normalize_range(spec: &str) -> Result<String, String> {
-    let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-    let parts: Vec<&str> = trimmed.split('-').collect();
-    if parts.len() > 2 {
-        return Err(format!(
-            "invalid range {:?}: expected uint32 or \"min-max\"",
-            trimmed
-        ));
-    }
-    let start_s = parts[0].trim();
-    let start = match parse_go_u32(start_s) {
-        Some(n) => n,
-        None => return Err(awg_parse_err(trimmed, parts[0], start_s)),
-    };
-    let end = if parts.len() == 2 {
-        let end_s = parts[1].trim();
-        match parse_go_u32(end_s) {
-            Some(n) => n,
-            None => return Err(awg_parse_err(trimmed, parts[1], end_s)),
-        }
-    } else {
-        start
-    };
-    if end < start {
-        return Err(format!("invalid range {trimmed:?}: range start > end"));
-    }
-    if end == 0 {
-        return Ok(String::new());
-    }
-    if start == end {
-        return Ok(start.to_string());
-    }
-    Ok(format!("{start}-{end}"))
-}
-
-fn awg_parse_err(spec: &str, raw_part: &str, trimmed_part: &str) -> String {
-    let reason = if trimmed_part.is_empty() || !trimmed_part.bytes().all(|b| b.is_ascii_digit()) {
-        "invalid syntax"
-    } else {
-        "value out of range"
-    };
-    format!(
-        "invalid range {:?}: parse {:?}: strconv.ParseUint: parsing {:?}: {reason}",
-        spec, raw_part, trimmed_part
-    )
-}
-
-fn parse_go_u32(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-/// AWGRange-typed field decode: null/empty-object OK, string normalized,
-/// in-range number OK; anything else is `invalid range <json>`.
 fn check_awg_range(value: &Value, at: &str) -> Result<(), String> {
-    match value {
-        v if is_zero_json(v) => Ok(()),
-        Value::Null => Ok(()),
-        Value::String(s) => awg_normalize_range(s)
-            .map(drop)
-            .map_err(|m| format!("{at}: {m}")),
-        Value::Number(n) => match n.as_u64() {
-            Some(x) if x <= u32::MAX as u64 => Ok(()),
-            _ => Err(format!(
-                "{at}: invalid range {value}: expected uint32 or \"min-max\" string"
-            )),
-        },
-        other => Err(format!(
-            "{at}: invalid range {other}: expected uint32 or \"min-max\" string"
-        )),
-    }
-}
-
-/// canonical form of an AWGRange field (`None` = unset), used by the
-/// initialize-time `IsSet` gate. Decode errors are unreachable here.
-fn awg_range_canonical(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) => awg_normalize_range(s).ok().filter(|c| !c.is_empty()),
-        Value::Number(n) => n
-            .as_u64()
-            .filter(|x| *x != 0 && *x <= u32::MAX as u64)
-            .map(|x| x.to_string()),
-        v if is_zero_json(v) => None,
-        _ => None,
-    }
+    crate::wireguard::parse_awg_range(Some(value))
+        .map(drop)
+        .map_err(|error| format!("{at}: {error}"))
 }
 
 /// Go `netip.ParsePrefix` failure reason (without the wrapper).
@@ -8154,43 +8178,22 @@ fn wireguard_endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), S
     if let Some(v) = obj.get("address") {
         check_prefix_list(v, &format!("{at}.address"))?;
     }
-    for f in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4"] {
+    for &f in crate::wireguard::AWG_INTEGER_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_unsigned(v, &format!("{at}.{f}"), AWG, f, u32::MAX as u64)?;
         }
     }
-    for f in [
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "content_padding_addition",
-        "rekey_after_time",
-        "rekey_timeout",
-        "reject_after_time",
-        "keepalive_timeout",
-        "max_handshake_attempts",
-    ] {
+    for &f in crate::wireguard::AWG_RANGE_FIELDS {
         if let Some(v) = obj.get(f) {
             check_awg_range(v, &format!("{at}.{f}"))?;
         }
     }
-    for f in [
-        "i1",
-        "i2",
-        "i3",
-        "i4",
-        "i5",
-        "id",
-        "ip",
-        "ib",
-        "header_protection_key",
-    ] {
+    for &f in crate::wireguard::AWG_STRING_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_str(v, &format!("{at}.{f}"), AWG, f)?;
         }
     }
-    for f in ["random_trailers", "disable_cookies"] {
+    for &f in crate::wireguard::AWG_BOOLEAN_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_bool(v, &format!("{at}.{f}"), AWG, f)?;
         }
@@ -8489,57 +8492,21 @@ fn wireguard_endpoint_initialize(
     }
 
     let u32_field = |key: &str| -> u64 { obj.get(key).and_then(Value::as_u64).unwrap_or(0) };
-    let (jc, jmin, jmax) = (u32_field("jc"), u32_field("jmin"), u32_field("jmax"));
+    let (jmin, jmax) = (u32_field("jmin"), u32_field("jmax"));
     let (s1, s2, s3, s4) = (
         u32_field("s1"),
         u32_field("s2"),
         u32_field("s3"),
         u32_field("s4"),
     );
-    let hpk = endpoint_str(obj, "header_protection_key");
-    let (id, ip, ib) = (
-        endpoint_str(obj, "id"),
-        endpoint_str(obj, "ip"),
-        endpoint_str(obj, "ib"),
-    );
-    let (i1, i2) = (endpoint_str(obj, "i1"), endpoint_str(obj, "i2"));
-    let ranges_set = [
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "content_padding_addition",
-        "rekey_after_time",
-        "rekey_timeout",
-        "reject_after_time",
-        "keepalive_timeout",
-        "max_handshake_attempts",
-    ]
-    .iter()
-    .any(|f| awg_range_canonical(obj.get(*f)).is_some());
-    let awg_set = jc != 0
-        || jmin != 0
-        || jmax != 0
-        || s1 != 0
-        || s2 != 0
-        || s3 != 0
-        || s4 != 0
-        || ranges_set
-        || [
-            i1,
-            i2,
-            endpoint_str(obj, "i3"),
-            endpoint_str(obj, "i4"),
-            endpoint_str(obj, "i5"),
-        ]
-        .iter()
-        .any(|s| !s.is_empty())
-        || !id.is_empty()
-        || !ip.is_empty()
-        || !ib.is_empty()
-        || !hpk.is_empty()
-        || obj.get("random_trailers").and_then(Value::as_bool) == Some(true)
-        || obj.get("disable_cookies").and_then(Value::as_bool) == Some(true);
+    let awg_text = |key| {
+        let value = endpoint_str(obj, key);
+        if value.trim().is_empty() { "" } else { value }
+    };
+    let hpk = awg_text("header_protection_key");
+    let (id, ip, ib) = (awg_text("id"), awg_text("ip"), awg_text("ib"));
+    let (i1, i2) = (awg_text("i1"), awg_text("i2"));
+    let awg_set = crate::wireguard::has_awg_options(obj);
     if awg_set
         && obj
             .get("peers")
@@ -8802,6 +8769,69 @@ fn decode_base64_url_raw(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejects_empty_or_recursive_xhttp_download_settings() {
+        let check = |download_settings: Value| {
+            crate::check_str(
+                &json!({
+                    "outbounds": [{
+                        "tag": "up",
+                        "type": "vless",
+                        "server": "127.0.0.1",
+                        "server_port": 8443,
+                        "uuid": "62df018b-dcd7-4a15-af7f-a73c76f827a8",
+                        "transport": {"type": "xhttp", "download_settings": download_settings}
+                    }]
+                })
+                .to_string(),
+            )
+        };
+        assert!(
+            check(json!({}))
+                .unwrap_err()
+                .contains("download_settings.server: expected a nonempty server address")
+        );
+        assert!(
+            check(json!({
+                "server": "127.0.0.1",
+                "server_port": 9443,
+                "transport": {"type": "xhttp", "download_settings": {}}
+            }))
+            .unwrap_err()
+            .contains("nested downloads are unsupported")
+        );
+        assert!(
+            check(json!({
+                "server": "127.0.0.1",
+                "server_port": 9443,
+                "transport": {"type": "xhttp"}
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validates_xray_tls_verification_options() {
+        let pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let check = |tls: Value| validate_tls_container(&tls, "outbounds[0].tls", false);
+        assert!(
+            check(json!({"verify_server_name": ["localhost", "127.0.0.1"],
+            "xray_pinned_peer_cert_sha256": [pin]}))
+            .is_ok()
+        );
+        for tls in [
+            json!({"verify_server_name": []}),
+            json!({"verify_server_name": ["localhost", 42]}),
+            json!({"verify_server_name": " "}),
+            json!({"xray_pinned_peer_cert_sha256": "AAAA"}),
+            json!({"xray_pinned_peer_cert_sha256": null}),
+            json!({"xray_pinned_peer_cert_sha256": [pin], "certificate_sha256": [pin]}),
+            json!({"verify_server_name": "localhost", "reality": {"enabled": true}}),
+        ] {
+            assert!(check(tls.clone()).is_err(), "{tls}");
+        }
+    }
+
     /// The `network_namespaces` section: a discriminated union on `type` with
     /// `tag` required, the path only for `default` and the pid file only for
     /// `unshare` -- reference `option.NetworkNamespace`.

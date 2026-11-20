@@ -29,10 +29,12 @@ use tokio::task::JoinHandle;
 
 use super::h1io;
 use super::h2io::{
-    CounterGuard, H2_PING_TIMEOUT, H2Acquire, H2Connection, H2Counter, H2Fresh, H2Pool, ReadClock,
-    TrackedStream, drive_h2_connection, h2_conn_idle, h2_handshake,
+    CounterGuard, H2_PING_TIMEOUT, H2Acquire, H2Connection, H2Counter, H2KeepAlive, H2Pool,
+    ReadClock, TrackedStream, drive_h2_connection, h2_conn_idle, h2_handshake,
 };
 use crate::inbound::AnyStream;
+use crate::outbound::dial::{DialOptions, connect_tcp};
+use crate::tls_client::TlsOptions;
 
 /// Opens one more connection to the same server, with the same TCP options, the
 /// same TLS and the same ALPN as the first.
@@ -349,6 +351,50 @@ pub(crate) struct XhttpConfig {
     half_close_idle: std::time::Duration,
     /// see [`super::h2io::H2_CONN_IDLE`]; `None` keeps pooled connections forever
     h2_idle: Option<std::time::Duration>,
+    download: Option<std::sync::Arc<DownloadSettings>>,
+}
+
+struct DownloadSettings {
+    server: String,
+    port: u16,
+    tls: Option<TlsOptions>,
+    transport: XhttpConfig,
+}
+
+impl DownloadSettings {
+    fn parse(value: &Value) -> anyhow::Result<Self> {
+        let at = "v2ray-xhttp.download_settings";
+        let settings = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{at}: expected an object"))?;
+        let server = settings
+            .get("server")
+            .and_then(Value::as_str)
+            .filter(|server| !server.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{at}.server: expected a nonempty address"))?;
+        let port = settings
+            .get("server_port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(|| anyhow::anyhow!("{at}.server_port: expected a port from 1 to 65535"))?;
+        let transport = settings
+            .get("transport")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("{at}.transport: expected an XHTTP transport object"))?;
+        if transport.get("type").and_then(Value::as_str) != Some("xhttp") {
+            anyhow::bail!("{at}.transport.type: expected xhttp");
+        }
+        if transport.contains_key("download_settings") {
+            anyhow::bail!("{at}.transport.download_settings: nested downloads are unsupported");
+        }
+        Ok(Self {
+            server: server.to_string(),
+            port,
+            tls: TlsOptions::from_outbound(settings, server, at)?,
+            transport: XhttpConfig::parse(transport)?,
+        })
+    }
 }
 
 impl XhttpConfig {
@@ -382,6 +428,14 @@ impl XhttpConfig {
                 headers.push((k.clone(), v.to_string()));
             }
         }
+        let download = t
+            .get("download_settings")
+            .map(DownloadSettings::parse)
+            .transpose()?
+            .map(std::sync::Arc::new);
+        if mode == Mode::StreamOne && download.is_some() {
+            anyhow::bail!("v2ray-xhttp.download_settings: stream-one has no separate download");
+        }
         Ok(Self {
             host,
             path,
@@ -402,6 +456,7 @@ impl XhttpConfig {
             h2_pool: std::sync::Arc::new(H2Pool::new()),
             half_close_idle: half_close_idle(),
             h2_idle: h2_conn_idle(),
+            download,
         })
     }
 }
@@ -410,6 +465,11 @@ pub(crate) enum H2Connect {
     Stream(AnyStream),
     Fallback(AnyStream),
     Skip,
+}
+
+enum Connection {
+    H1(AnyStream),
+    H2(h2::client::SendRequest<Bytes>, CounterGuard),
 }
 
 impl XhttpConfig {
@@ -430,12 +490,11 @@ impl XhttpConfig {
     async fn open_h2_session(
         &self,
         mut send_req: h2::client::SendRequest<Bytes>,
-        counter: std::sync::Arc<H2Counter>,
+        guard: CounterGuard,
         scheme: &str,
         authority: &str,
         mode: Mode,
     ) -> io::Result<AnyStream> {
-        let guard = CounterGuard::new(counter);
         if mode == Mode::StreamOne {
             let request = self.build_request(
                 scheme,
@@ -455,6 +514,24 @@ impl XhttpConfig {
         }
 
         let mut this = SplitConn::new(self);
+        self.open_h2_download(&mut this, &mut send_req, scheme, authority)?;
+        self.open_h2_upload(&mut this, send_req, scheme, authority, mode)
+            .await?;
+        Ok(Box::new(TrackedStream::new(
+            Box::new(XhttpConn {
+                split: Box::new(this),
+            }),
+            guard.into_inner(),
+        )))
+    }
+
+    fn open_h2_download(
+        &self,
+        this: &mut SplitConn,
+        send_req: &mut h2::client::SendRequest<Bytes>,
+        scheme: &str,
+        authority: &str,
+    ) -> io::Result<()> {
         let get_req = self.build_request(
             scheme,
             authority,
@@ -467,7 +544,17 @@ impl XhttpConfig {
             .send_request(go_h2_request(get_req), true)
             .map_err(|e| io::Error::other(format!("xhttp: h2 GET send_request: {e}")))?;
         this.set_h2_download_stream(get_resp);
+        Ok(())
+    }
 
+    async fn open_h2_upload(
+        &self,
+        this: &mut SplitConn,
+        send_req: h2::client::SendRequest<Bytes>,
+        scheme: &str,
+        authority: &str,
+        mode: Mode,
+    ) -> io::Result<()> {
         match mode {
             Mode::StreamUp => {
                 let up_req = self.build_request(
@@ -496,8 +583,6 @@ impl XhttpConfig {
                 this.spawn_h2_upload_ack(up_resp, failure);
             }
             _ => {
-                let (client_write, worker_read) = tokio::io::duplex(128 * 1024);
-                let failure = Failure::default();
                 let writer = PostWriter {
                     cfg: self.clone(),
                     scheme: scheme.to_string(),
@@ -512,128 +597,174 @@ impl XhttpConfig {
                         })
                     }),
                     h2_client: Some(send_req),
+                    first_connection: None,
                 };
-                let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
-                let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
-                let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-                let task = tokio::spawn(packet_upload_worker(
-                    worker_read,
-                    writer,
-                    failure.clone(),
-                    std::sync::Arc::clone(&bytes_flushed),
-                    std::sync::Arc::clone(&flush_notify),
-                ));
-                this.up = Up::Packets(Box::new(PacketsUp {
-                    io: client_write,
-                    failure,
-                    bytes_written,
-                    bytes_flushed,
-                    flush_notify,
-                    flush_wait: None,
-                    task,
-                }));
+                this.spawn_packets_up(writer);
             }
         }
-
-        Ok(Box::new(TrackedStream::new(
-            Box::new(XhttpConn {
-                split: Box::new(this),
-            }),
-            guard.into_inner(),
-        )))
+        Ok(())
     }
 
     pub(crate) async fn connect_h2_stream(
         &self,
-        tls: Option<&crate::tls_client::TlsOptions>,
+        tls: Option<&TlsOptions>,
         server: &str,
         port: u16,
-        dial: &crate::outbound::dial::DialOptions,
+        dial: &DialOptions,
     ) -> io::Result<H2Connect> {
-        let Some(tls) = tls else {
+        let Some(tls) = tls.filter(|tls| !self.h1_only(Some(tls))) else {
             return Ok(H2Connect::Skip);
         };
-        if self.h1_only(Some(tls)) {
-            return Ok(H2Connect::Skip);
-        }
-        let has_reality = tls.reality().is_some();
-        let mode = self.resolved_mode(has_reality);
+        let mode = self.resolved_mode(tls.reality().is_some());
         let authority = self.authority_for(tls.server_name(), server, port);
-        let scheme = "https";
-        let max_conns = self.pool.max_connections();
-
-        {
-            let acq = self
-                .h2_pool
-                .acquire(max_conns, self.pool.max_concurrency())
-                .await;
-            match acq {
-                H2Acquire::Ready(send_req, counter) => {
-                    let result = self
-                        .open_h2_session(send_req, counter.clone(), scheme, &authority, mode)
-                        .await;
-                    if result.is_err() {
-                        self.h2_pool.evict(&counter).await;
-                    }
-                    result.map(H2Connect::Stream)
-                }
-                H2Acquire::NeedDial(dial_guard) => {
-                    let dialed: io::Result<Result<H2Fresh, AnyStream>> = async {
-                        let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
-                        let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-                        let stream = tls.wrap_with_defaults(tcp, alpn).await?;
-                        let negotiated = crate::inbound::stream_alpn(&stream);
-                        // Xray REALITY sets NextProtos = nil on the server (so EncryptedExtensions
-                        // carries no ALPN, logged as alpn=[]) while serving HTTP/2 (SetUnencryptedHTTP2)
-                        // on the inner listener. Standard TLS servers without h2 ALPN fall back to
-                        // the HTTP/1.1 xhttp::connect path on the already-established stream.
-                        let is_h2 = negotiated == Some(b"h2")
-                            || (has_reality && negotiated != Some(b"http/1.1"));
-                        if !is_h2 {
-                            return Ok(Err(stream));
-                        }
-                        Ok(Ok(h2_handshake(stream, &xhttp_h2_builder(), "xhttp").await?))
-                    }
+        match self.pooled_connection(tls, server, port, dial).await? {
+            Connection::H1(stream) => Ok(H2Connect::Fallback(stream)),
+            Connection::H2(send_req, guard) => {
+                let counter = guard.into_inner();
+                let result = self
+                    .open_h2_session(
+                        send_req,
+                        CounterGuard::new(counter.clone()),
+                        "https",
+                        &authority,
+                        mode,
+                    )
                     .await;
+                if result.is_err() {
+                    self.h2_pool.evict(&counter).await;
+                }
+                result.map(H2Connect::Stream)
+            }
+        }
+    }
 
-                    match dialed {
-                        Ok(Ok((send_request, connection, clock))) => {
-                            let counter = self
-                                .register_h2(send_request.clone(), connection, clock, max_conns)
-                                .await;
-                            drop(dial_guard);
-                            let guard = CounterGuard::new(counter.clone());
-                            let send_req = match send_request.ready().await {
-                                Ok(req) => req,
-                                Err(e) => {
-                                    drop(guard);
-                                    self.h2_pool.evict(&counter).await;
-                                    return Err(io::Error::other(format!("xhttp: h2 ready: {e}")));
-                                }
-                            };
-                            let stream = self
-                                .open_h2_session(
-                                    send_req,
-                                    guard.into_inner(),
-                                    scheme,
-                                    &authority,
-                                    mode,
-                                )
-                                .await?;
-                            Ok(H2Connect::Stream(stream))
-                        }
-                        Ok(Err(fallback_stream)) => {
-                            drop(dial_guard);
-                            Ok(H2Connect::Fallback(fallback_stream))
-                        }
-                        Err(e) => {
-                            drop(dial_guard);
-                            Err(e)
-                        }
+    async fn pooled_connection(
+        &self,
+        tls: &TlsOptions,
+        server: &str,
+        port: u16,
+        dial: &DialOptions,
+    ) -> io::Result<Connection> {
+        let max_conns = self.pool.max_connections();
+        match self
+            .h2_pool
+            .acquire(max_conns, self.pool.max_concurrency())
+            .await
+        {
+            H2Acquire::Ready(send_req, counter) => {
+                Ok(Connection::H2(send_req, CounterGuard::new(counter)))
+            }
+            H2Acquire::NeedDial(dial_guard) => {
+                let tcp = connect_tcp(server, port, dial).await?;
+                let stream = tls.wrap_with_defaults(tcp, &[b"h2", b"http/1.1"]).await?;
+                let negotiated = crate::inbound::stream_alpn(&stream);
+                // Xray REALITY can omit ALPN while serving HTTP/2 on the inner listener.
+                let is_h2 = negotiated == Some(b"h2")
+                    || (tls.reality().is_some() && negotiated != Some(b"http/1.1"));
+                if !is_h2 {
+                    return Ok(Connection::H1(stream));
+                }
+                let (send_request, connection, clock) =
+                    h2_handshake(stream, &xhttp_h2_builder(), "xhttp").await?;
+                let counter = self
+                    .register_h2(send_request.clone(), connection, clock, max_conns)
+                    .await;
+                drop(dial_guard);
+                let guard = CounterGuard::new(counter.clone());
+                match send_request.ready().await {
+                    Ok(req) => Ok(Connection::H2(req, guard)),
+                    Err(e) => {
+                        drop(guard);
+                        self.h2_pool.evict(&counter).await;
+                        Err(io::Error::other(format!("xhttp: h2 ready: {e}")))
                     }
                 }
             }
         }
+    }
+
+    async fn connect_endpoint(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        dial: &DialOptions,
+    ) -> io::Result<Connection> {
+        if let Some(tls) = tls.filter(|tls| !self.h1_only(Some(tls))) {
+            return self.pooled_connection(tls, server, port, dial).await;
+        }
+        let tcp = connect_tcp(server, port, dial).await?;
+        let stream = match tls {
+            Some(tls) => tls.wrap_with_defaults(tcp, &[b"http/1.1"]).await?,
+            None => Box::new(tcp),
+        };
+        Ok(Connection::H1(stream))
+    }
+
+    pub(crate) fn has_download_settings(&self) -> bool {
+        self.download.is_some()
+    }
+
+    pub(crate) async fn connect_split(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        dial: &DialOptions,
+        dialer: std::sync::Arc<Dialer>,
+    ) -> io::Result<AnyStream> {
+        let down = self.download.as_deref().expect("separate XHTTP download");
+        let (upload, download) = tokio::try_join!(
+            self.connect_endpoint(tls, server, port, dial),
+            down.transport
+                .connect_endpoint(down.tls.as_ref(), &down.server, down.port, dial),
+        )?;
+        let mut session = SplitConn::new(self);
+        let mode = self.resolved_mode(tls.and_then(TlsOptions::reality).is_some());
+        let authority = self.authority_for(tls.map_or("", TlsOptions::server_name), server, port);
+        let down_authority = down.transport.authority_for(
+            down.tls.as_ref().map_or("", TlsOptions::server_name),
+            &down.server,
+            down.port,
+        );
+        let down_scheme = if down.tls.is_some() { "https" } else { "http" };
+        let down_guard = match download {
+            Connection::H1(stream) => {
+                down.transport
+                    .open_h1_download(&mut session, stream, down_scheme, &down_authority)
+                    .await?;
+                None
+            }
+            Connection::H2(mut send_req, guard) => {
+                down.transport.open_h2_download(
+                    &mut session,
+                    &mut send_req,
+                    down_scheme,
+                    &down_authority,
+                )?;
+                Some(guard)
+            }
+        };
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let up_guard = match upload {
+            Connection::H1(stream) => {
+                self.open_h1_upload(&mut session, scheme, &authority, mode, dialer, Some(stream))
+                    .await?;
+                None
+            }
+            Connection::H2(send_req, guard) => {
+                self.open_h2_upload(&mut session, send_req, scheme, &authority, mode)
+                    .await?;
+                Some(guard)
+            }
+        };
+        let mut tunnel: AnyStream = Box::new(XhttpConn {
+            split: Box::new(session),
+        });
+        for guard in [down_guard, up_guard].into_iter().flatten() {
+            tunnel = Box::new(TrackedStream::new(tunnel, guard.into_inner()));
+        }
+        Ok(tunnel)
     }
 
     /// Put a fresh HTTP/2 connection into the pool and start driving it,
@@ -655,7 +786,7 @@ impl XhttpConfig {
             clock,
             self.pool
                 .h2_keep_alive()
-                .map(|period| (period, H2_PING_TIMEOUT)),
+                .map(|period| H2KeepAlive::always(period, H2_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&self.h2_pool),
             counter.clone(),
             self.h2_idle,
@@ -666,9 +797,10 @@ impl XhttpConfig {
 
     /// The mode a session runs in. `auto` follows Xray (splithttp/dialer.go,
     /// `mode == "auto"`): packet-up, or stream-one under REALITY. Xray picks
-    /// stream-up for REALITY with `downloadSettings`, which this client has not.
+    /// stream-up for REALITY when the download uses a separate endpoint.
     fn resolved_mode(&self, has_reality: bool) -> Mode {
         match self.mode {
+            Mode::Auto if has_reality && self.download.is_some() => Mode::StreamUp,
             Mode::Auto if has_reality => Mode::StreamOne,
             Mode::Auto => Mode::PacketUp,
             other => other,
@@ -728,7 +860,7 @@ pub(crate) async fn connect(
             }
         };
         return cfg
-            .open_h2_session(send_req, guard.into_inner(), scheme, &authority, mode)
+            .open_h2_session(send_req, guard, scheme, &authority, mode)
             .await;
     }
 
@@ -757,96 +889,96 @@ pub(crate) async fn connect(
         }));
     }
 
-    // The download GET is a long request, so it takes a connection of its own
-    // with `Connection: close` — the reference says outright that a download GET
-    // never shares one. The connection the caller dialled is exactly that, so
-    // nothing extra is opened for it.
-    let mut io = stream;
-    let request = cfg.build_request(
-        scheme,
-        &authority,
-        "GET",
-        Some(&this.session_id),
-        None,
-        false,
-    )?;
-    let mut head_bytes = Vec::with_capacity(256);
-    h1io::write_head(
-        &mut head_bytes,
-        &request,
-        &authority,
-        h1io::Framing::None,
-        true,
-    );
-    io.write_all(&head_bytes).await?;
-    io.flush().await?;
-    this.spawn_download_stream(io);
-
-    match mode {
-        Mode::StreamUp => {
-            let request = cfg.build_request(
-                scheme,
-                &authority,
-                &cfg.meta.uplink_method,
-                Some(&this.session_id),
-                None,
-                true,
-            )?;
-            let io = (dialer)().await?;
-            let (io, resp) = h1io::Stream::start(io, &request, &authority, false).await?;
-            let failure = Failure::default();
-            this.up = Up::Stream(Box::new(StreamUp {
-                io,
-                failure: failure.clone(),
-            }));
-            // the upload's own response carries nothing back: it only says
-            // whether the server took the request
-            this.spawn_upload_ack(resp, failure);
-        }
-        // packet-up (and auto→packet-up)
-        _ => {
-            let (client_write, worker_read) = tokio::io::duplex(128 * 1024);
-            let failure = Failure::default();
-            let writer = PostWriter {
-                cfg: cfg.clone(),
-                scheme: scheme.to_string(),
-                authority: authority.clone(),
-                session_id: this.session_id.clone(),
-                seq: 0,
-                dialer,
-                h2_client: None,
-            };
-            let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
-            let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
-            let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-            let task = tokio::spawn(packet_upload_worker(
-                worker_read,
-                writer,
-                failure.clone(),
-                std::sync::Arc::clone(&bytes_flushed),
-                std::sync::Arc::clone(&flush_notify),
-            ));
-            this.up = Up::Packets(Box::new(PacketsUp {
-                io: client_write,
-                failure,
-                bytes_written,
-                bytes_flushed,
-                flush_notify,
-                flush_wait: None,
-                task,
-            }));
-        }
-    }
+    // The download GET uses a dedicated HTTP/1.1 connection.
+    cfg.open_h1_download(&mut this, stream, scheme, &authority)
+        .await?;
+    cfg.open_h1_upload(&mut this, scheme, &authority, mode, dialer, None)
+        .await?;
     Ok(Box::new(XhttpConn {
         split: Box::new(this),
     }))
 }
 
+impl XhttpConfig {
+    async fn open_h1_download(
+        &self,
+        this: &mut SplitConn,
+        mut io: AnyStream,
+        scheme: &str,
+        authority: &str,
+    ) -> io::Result<()> {
+        let request = self.build_request(
+            scheme,
+            authority,
+            "GET",
+            Some(&this.session_id),
+            None,
+            false,
+        )?;
+        let mut head_bytes = Vec::with_capacity(256);
+        h1io::write_head(
+            &mut head_bytes,
+            &request,
+            authority,
+            h1io::Framing::None,
+            true,
+        );
+        io.write_all(&head_bytes).await?;
+        io.flush().await?;
+        this.spawn_download_stream(io);
+        Ok(())
+    }
+
+    async fn open_h1_upload(
+        &self,
+        this: &mut SplitConn,
+        scheme: &str,
+        authority: &str,
+        mode: Mode,
+        dialer: std::sync::Arc<Dialer>,
+        first_connection: Option<AnyStream>,
+    ) -> io::Result<()> {
+        if mode == Mode::StreamUp {
+            let request = self.build_request(
+                scheme,
+                authority,
+                &self.meta.uplink_method,
+                Some(&this.session_id),
+                None,
+                true,
+            )?;
+            let io = match first_connection {
+                Some(io) => io,
+                None => (dialer)().await?,
+            };
+            let (io, resp) = h1io::Stream::start(io, &request, authority, false).await?;
+            let failure = Failure::default();
+            this.up = Up::Stream(Box::new(StreamUp {
+                io,
+                failure: failure.clone(),
+            }));
+            this.spawn_upload_ack(resp, failure);
+        } else {
+            this.spawn_packets_up(PostWriter {
+                cfg: self.clone(),
+                scheme: scheme.to_string(),
+                authority: authority.to_string(),
+                session_id: this.session_id.clone(),
+                seq: 0,
+                dialer,
+                h2_client: None,
+                first_connection,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// What an upload request's response said, once the task behind it has seen it.
 ///
 /// The error lives behind a lock rather than in the write path because it
-/// arrives on somebody else's task: a refused upload POST shows up as the next
-/// `poll_write` failing, not as the write that was already in flight.
+/// arrives on somebody else's task. Failure is terminal and remains visible
+/// to later writes and flushes.
 #[derive(Clone, Default)]
 struct Failure(std::sync::Arc<std::sync::Mutex<Option<io::Error>>>);
 
@@ -857,8 +989,11 @@ impl Failure {
         }
     }
 
-    fn take(&self) -> Option<io::Error> {
-        self.0.lock().ok().and_then(|mut slot| slot.take())
+    fn error(&self) -> Option<io::Error> {
+        self.0.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(|error| io::Error::new(error.kind(), error.to_string()))
+        })
     }
 }
 
@@ -884,12 +1019,16 @@ struct PostWriter {
     seq: u64,
     dialer: std::sync::Arc<Dialer>,
     h2_client: Option<h2::client::SendRequest<Bytes>>,
+    first_connection: Option<AnyStream>,
 }
 
 impl PostWriter {
     /// A keep-alive connection for one upload POST, out of the pool when there
     /// is a free one and dialled when there is not.
-    async fn connection(&self) -> io::Result<(super::xmux::Lease, AnyStream)> {
+    async fn connection(&mut self) -> io::Result<(super::xmux::Lease, AnyStream)> {
+        if let Some(io) = self.first_connection.take() {
+            return self.register_connection(io).await;
+        }
         if let Some(client) = self.cfg.pool.acquire().await {
             let mut lease = super::xmux::Lease::new(client);
             if let Some(io) = lease.take() {
@@ -901,8 +1040,15 @@ impl PostWriter {
     }
 
     /// Always dial a fresh HTTP/1.1 connection and register it in the pool.
-    async fn fresh_connection(&self) -> io::Result<(super::xmux::Lease, AnyStream)> {
+    async fn fresh_connection(&mut self) -> io::Result<(super::xmux::Lease, AnyStream)> {
         let io = (self.dialer)().await?;
+        self.register_connection(io).await
+    }
+
+    async fn register_connection(
+        &mut self,
+        io: AnyStream,
+    ) -> io::Result<(super::xmux::Lease, AnyStream)> {
         let client = self.cfg.pool.insert(io).await;
         // `insert` parks the connection in the pool, and the pool is the only
         // owner, so it comes back out through the same door
@@ -915,7 +1061,6 @@ impl PostWriter {
 
     /// Send one upload chunk over HTTP/2.
     async fn send_packet_h2(
-        &self,
         client: h2::client::SendRequest<Bytes>,
         req: http::Request<()>,
         payload: Bytes,
@@ -1038,8 +1183,6 @@ impl PostWriter {
             };
             let hname = http::HeaderName::try_from(name.as_str())
                 .map_err(|e| io::Error::other(format!("xhttp: header name: {e}")))?;
-            let hvalue = http::HeaderValue::try_from(*piece)
-                .map_err(|e| io::Error::other(format!("xhttp: header value: {e}")))?;
             if let UplinkPlacement::Cookie = self.cfg.meta.uplink_data {
                 if let Some(h) = req.headers_mut().get_mut("cookie") {
                     let mut v = h.as_bytes().to_vec();
@@ -1049,15 +1192,19 @@ impl PostWriter {
                         .map_err(|e| io::Error::other(format!("xhttp: cookie: {e}")))?;
                     continue;
                 }
-                req.headers_mut().insert("cookie", hvalue);
+                let value = http::HeaderValue::from_str(&format!("{name}={piece}"))
+                    .map_err(|e| io::Error::other(format!("xhttp: cookie: {e}")))?;
+                req.headers_mut().insert("cookie", value);
             } else {
+                let hvalue = http::HeaderValue::try_from(*piece)
+                    .map_err(|e| io::Error::other(format!("xhttp: header value: {e}")))?;
                 req.headers_mut().insert(hname, hvalue);
             }
         }
         let payload = payload.unwrap_or_default();
 
         if let Some(h2_client) = &self.h2_client {
-            return self.send_packet_h2(h2_client.clone(), req, payload).await;
+            return Self::send_packet_h2(h2_client.clone(), req, payload).await;
         }
 
         let (lease, io) = self.connection().await?;
@@ -1100,8 +1247,8 @@ struct SplitConn {
     dl_error: Option<io::Error>,
     dl: mpsc::Receiver<io::Result<Bytes>>,
     direct_h2: Option<DirectH2Download>,
-    dl_task: Option<tokio::task::JoinHandle<()>>,
-    ack_task: Option<tokio::task::JoinHandle<()>>,
+    dl_task: Option<JoinHandle<()>>,
+    ack_task: Option<JoinHandle<()>>,
     up: Up,
     session_id: String,
     /// Armed when a packet-up upload is shut down; see [`HALF_CLOSE_IDLE`].
@@ -1256,9 +1403,33 @@ impl SplitConn {
         }
     }
 
+    fn spawn_packets_up(&mut self, writer: PostWriter) {
+        let (io, worker_read) = tokio::io::duplex(128 * 1024);
+        let failure = Failure::default();
+        let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
+        let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
+        let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(packet_upload_worker(
+            worker_read,
+            writer,
+            failure.clone(),
+            std::sync::Arc::clone(&bytes_flushed),
+            std::sync::Arc::clone(&flush_notify),
+        ));
+        self.up = Up::Packets(Box::new(PacketsUp {
+            io,
+            failure,
+            bytes_written,
+            bytes_flushed,
+            flush_notify,
+            flush_wait: None,
+            task,
+        }));
+    }
+
     /// End the whole session: cancel the download request (an HTTP/1.1
     /// download connection is closed, an HTTP/2 stream is reset) and stop
-    /// the upload. Reads see EOF from here on.
+    /// the upload. The caller can still read the retained download chunk.
     fn finish(&mut self) {
         self.direct_h2 = None;
         if let Some(task) = self.dl_task.take() {
@@ -1309,23 +1480,14 @@ impl SplitConn {
 
     /// The upload request's response when it *is* the download stream, which is
     /// what stream-one does: one request, body up and body down.
-    fn spawn_upload_download(
-        &mut self,
-        task: JoinHandle<io::Result<h1io::Body>>,
-        failure: Failure,
-    ) {
+    fn spawn_upload_download(&mut self, response: h1io::Response, failure: Failure) {
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         self.dl = rx;
         self.dl_task = Some(tokio::spawn(async move {
-            match task.await {
-                Ok(Ok(body)) => pump(body, tx).await,
-                Ok(Err(e)) => {
-                    failure.set(e);
-                    let _ = tx.send(Err(failure.take().expect("just set"))).await;
-                }
+            match response.read().await {
+                Ok(body) => pump(body, tx).await,
                 Err(e) => {
-                    let e = io::Error::other(format!("xhttp: upload: {e}"));
-                    failure.set(io::Error::other(e.to_string()));
+                    failure.set(io::Error::new(e.kind(), e.to_string()));
                     let _ = tx.send(Err(e)).await;
                 }
             }
@@ -1336,19 +1498,15 @@ impl SplitConn {
     /// is stream-up: the download has a connection of its own, so this response
     /// only says whether the server took the request. Drain it and keep a
     /// failure for the next write.
-    fn spawn_upload_ack(&mut self, task: JoinHandle<io::Result<h1io::Body>>, failure: Failure) {
+    fn spawn_upload_ack(&mut self, response: h1io::Response, failure: Failure) {
         if let Some(old) = self.ack_task.take() {
             old.abort();
         }
         self.ack_task = Some(tokio::spawn(async move {
-            let mut body = match task.await {
-                Ok(Ok(body)) => body,
-                Ok(Err(e)) => {
-                    failure.set(e);
-                    return;
-                }
+            let mut body = match response.read().await {
+                Ok(body) => body,
                 Err(e) => {
-                    failure.set(io::Error::other(format!("xhttp: upload: {e}")));
+                    failure.set(e);
                     return;
                 }
             };
@@ -1500,7 +1658,11 @@ impl AsyncRead for XhttpConn {
                         split.session_id, idle.limit
                     ));
                     split.finish();
-                    return Poll::Ready(Ok(()));
+                    if split.pending.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Credit backpressure may have stopped a partial H2 read.
+                    // The canceled stream no longer needs credit to drain it.
                 }
             }
         }
@@ -1518,19 +1680,19 @@ impl AsyncWrite for XhttpConn {
             Up::Stream(state) => {
                 // a refused upload POST is reported here, not on the write that
                 // was already in flight when the answer came back
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::H2Stream(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::Packets(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 let res = Pin::new(&mut state.io).poll_write(cx, buf);
@@ -1548,10 +1710,20 @@ impl AsyncWrite for XhttpConn {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
         match &mut split.up {
-            Up::Stream(state) => Pin::new(&mut state.io).poll_flush(cx),
-            Up::H2Stream(state) => Pin::new(&mut state.io).poll_flush(cx),
+            Up::Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
+                Pin::new(&mut state.io).poll_flush(cx)
+            }
+            Up::H2Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
+                Pin::new(&mut state.io).poll_flush(cx)
+            }
             Up::Packets(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 let written = state
@@ -1575,7 +1747,7 @@ impl AsyncWrite for XhttpConn {
                     // The worker can complete (or fail) between the first
                     // counter check and registration of this notification.
                     // Recheck after polling, when the waiter is registered.
-                    if let Some(e) = state.failure.take() {
+                    if let Some(e) = state.failure.error() {
                         return Poll::Ready(Err(e));
                     }
                     if state
@@ -1609,9 +1781,15 @@ impl AsyncWrite for XhttpConn {
         let split = &mut *self.split;
         match &mut split.up {
             Up::Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
                 ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
             }
             Up::H2Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
                 ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
             }
             Up::Packets(state) => {
@@ -2123,6 +2301,7 @@ mod tests {
             seq: 0,
             dialer,
             h2_client: None,
+            first_connection: None,
         };
         let (mut input, reader) = tokio::io::duplex(1024);
         let flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
@@ -2241,7 +2420,7 @@ mod tests {
         let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
-            keep_alive,
+            keep_alive.map(|(period, timeout)| h2io::H2KeepAlive::always(period, timeout)),
             std::sync::Arc::downgrade(&pool),
             counter,
             idle,
@@ -2361,7 +2540,7 @@ mod tests {
         let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
-            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            Some(h2io::H2KeepAlive::always(TEST_PERIOD, TEST_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&pool),
             counter,
             Some(TEST_H2_IDLE),
@@ -2513,6 +2692,102 @@ mod tests {
             assert_eq!(c.resolved_mode(false), mode, "{raw} without REALITY");
             assert_eq!(c.resolved_mode(true), mode, "{raw} with REALITY");
         }
+        let split = cfg(json!({
+            "download_settings": {
+                "server": "download.example",
+                "server_port": 443,
+                "transport": {"type": "xhttp"}
+            }
+        }));
+        assert_eq!(split.resolved_mode(false), Mode::PacketUp);
+        assert_eq!(split.resolved_mode(true), Mode::StreamUp);
+    }
+
+    #[tokio::test]
+    async fn split_http1_uses_independent_settings_and_one_session() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn request(socket: TcpStream) -> (String, BufReader<TcpStream>) {
+            let mut io = BufReader::new(socket);
+            let mut head = String::new();
+            loop {
+                let last = head.len();
+                assert_ne!(io.read_line(&mut head).await.unwrap(), 0);
+                if &head[last..] == "\r\n" {
+                    break;
+                }
+            }
+            (head, io)
+        }
+
+        let uplink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downlink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = uplink.local_addr().unwrap().port();
+        let down_port = downlink.local_addr().unwrap().port();
+        let config = json!({"transport": {
+            "type": "xhttp", "path": "/up", "host": "up.example",
+            "download_settings": {
+                "server": "127.0.0.1", "server_port": down_port,
+                "transport": {"type": "xhttp", "path": "/down", "host": "down.example"}
+            }
+        }});
+        let transport =
+            super::super::Transport::parse(config.as_object().unwrap(), "test").unwrap();
+        let client = async {
+            let mut stream = transport
+                .connect_or_dial(None, "127.0.0.1", up_port, &DialOptions::default())
+                .await
+                .unwrap();
+            stream.write_all(b"from client").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut reply = [0; 9];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"from peer");
+        };
+        let peer = async {
+            let (down, _) = downlink.accept().await.unwrap();
+            let (down_head, mut down) = request(down).await;
+            let download_path = down_head.split_whitespace().nth(1).unwrap();
+            let session = download_path
+                .split('?')
+                .next()
+                .unwrap()
+                .strip_prefix("/down/")
+                .unwrap();
+            assert!(down_head.starts_with("GET /down/"));
+            assert!(
+                down_head
+                    .to_ascii_lowercase()
+                    .contains("\r\nhost: down.example\r\n")
+            );
+
+            let (up, _) = uplink.accept().await.unwrap();
+            let (up_head, mut up) = request(up).await;
+            assert!(up_head.starts_with(&format!("POST /up/{session}/0")));
+            assert!(
+                up_head
+                    .to_ascii_lowercase()
+                    .contains("\r\nhost: up.example\r\n")
+            );
+            let mut data = [0; 11];
+            up.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"from client");
+            up.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            down.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfrom peer")
+                .await
+                .unwrap();
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, peer);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -2923,6 +3198,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_up_cookie_payload_names_each_chunk() {
+        for (headers, expected) in [
+            (json!({}), "x_data_0=cGl; x_data_1=uZw"),
+            (
+                json!({"cookie": "proxy=value"}),
+                "proxy=value; x_data_0=cGl; x_data_1=uZw",
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut writer = PostWriter {
+                cfg: cfg(json!({
+                    "mode": "packet-up", "uplink_data_placement": "cookie",
+                    "uplink_chunk_size": 3, "headers": headers
+                })),
+                scheme: "http".into(),
+                authority: "srv".into(),
+                session_id: "test-session".into(),
+                seq: 0,
+                dialer: std::sync::Arc::new(|| {
+                    Box::pin(async { Err(io::Error::other("first connection was supplied")) })
+                }),
+                h2_client: None,
+                first_connection: Some(Box::new(client)),
+            };
+            let peer = async {
+                let head = read_request_head(&mut server).await;
+                assert_eq!(
+                    head.lines().find_map(|line| line.strip_prefix("cookie: ")),
+                    Some(expected)
+                );
+                server
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(writer.send_packet(b"ping"), peer)
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_http1_stream_one_cancels_a_pending_response() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let dialer = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("unused dial")) })
+                as Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>>
+        });
+        let config = cfg(json!({"mode": "stream-one"}));
+        let connection = super::connect(Box::new(client), false, false, "srv", 80, &config, dialer)
+            .await
+            .unwrap();
+        read_request_head(&mut peer).await;
+        drop(connection);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), peer.read(&mut byte))
+                .await
+                .expect("upload response reader must drop with the tunnel")
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn http1_stream_one_rejection_reaches_both_halves() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let dialer = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("unused dial")) })
+                as Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>>
+        });
+        let config = cfg(json!({"mode": "stream-one"}));
+        let mut connection =
+            super::connect(Box::new(client), false, false, "srv", 80, &config, dialer)
+                .await
+                .unwrap();
+        read_request_head(&mut peer).await;
+        peer.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0];
+        let read = connection.read(&mut byte).await.unwrap_err();
+        let write = connection.write(b"ping").await.unwrap_err();
+        assert!(read.to_string().contains("403"));
+        assert!(write.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn packet_up_keeps_rejected_post_visible_to_later_flush() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (download, _get_peer) = tokio::io::duplex(65536);
+            let (post_tx, mut post_rx) = mpsc::unbounded_channel();
+            let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+                let post_tx = post_tx.clone();
+                Box::pin(async move {
+                    let (client, peer) = tokio::io::duplex(65536);
+                    post_tx.send(peer).unwrap();
+                    Ok(Box::new(client) as AnyStream)
+                })
+            });
+            let config = cfg(json!({"mode": "packet-up"}));
+            let mut connection =
+                super::connect(Box::new(download), false, false, "srv", 80, &config, dialer)
+                    .await
+                    .unwrap();
+            connection.write_all(b"ping").await.unwrap();
+            let mut post = post_rx.recv().await.unwrap();
+            read_request_head(&mut post).await;
+            let mut data = [0; 4];
+            post.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"ping");
+            post.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let error =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), connection.flush())
+                        .await
+                        .expect("terminal POST error must not leave flush waiting")
+                        .unwrap_err();
+                assert!(error.to_string().contains("403"));
+            }
+        })
+        .await
+        .expect("POST setup must complete");
+    }
+
+    #[tokio::test]
     async fn failed_upload_is_not_replayed_and_next_attempt_dials_fresh() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = std::sync::Arc::new(AtomicUsize::new(0));
@@ -2957,6 +3363,7 @@ mod tests {
             authority: "srv".into(),
             session_id: "test-session".into(),
             h2_client: None,
+            first_connection: None,
             seq: 0,
             dialer,
         };
@@ -4188,100 +4595,111 @@ mod tests {
         .expect("all exact pairs must drain without another input wake");
     }
 
-    #[tokio::test]
-    async fn direct_h2_bounded_credit_keeps_neighbor_and_cancel_working() {
-        use std::sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
-        };
-        use tokio::io::AsyncReadExt;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            const BULK: usize = 65 * 8192;
-            let (client_io, server_io) = tokio::io::duplex(65536);
-            let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-            let server = tokio::spawn(async move {
-                let mut connection = h2io::server_builder()
-                    .handshake::<_, Bytes>(server_io)
-                    .await
-                    .unwrap();
-                while let Some(Ok((request, mut response))) = connection.accept().await {
-                    let bulk = request.uri().path() == "/bulk";
-                    let mut send = response
-                        .send_response(http::Response::new(()), false)
-                        .unwrap();
-                    send.send_data(
-                        if bulk {
-                            Bytes::from(vec![b'x'; BULK])
-                        } else {
-                            Bytes::from_static(b"ok")
-                        },
-                        !bulk,
-                    )
-                    .unwrap();
-                    if bulk {
-                        let reset_tx = reset_tx.clone();
-                        tokio::spawn(async move {
-                            let reason = std::future::poll_fn(|cx| send.poll_reset(cx))
-                                .await
-                                .unwrap();
-                            reset_tx.send(reason).unwrap();
-                        });
-                    }
-                }
-            });
-            let (mut client, mut connection) = h2io::client_builder()
-                .handshake::<_, Bytes>(client_io)
+    struct FullH2CreditQueue {
+        client: h2::client::SendRequest<Bytes>,
+        connection: h2::client::Connection<tokio::io::DuplexStream, Bytes>,
+        body: h2::RecvStream,
+        resets: mpsc::UnboundedReceiver<h2::Reason>,
+        server: JoinHandle<()>,
+    }
+
+    /// Stop polling the live connection after receiving the body, so callers
+    /// can fill the credit queue and exercise a pending read before resuming.
+    async fn full_h2_credit_queue() -> FullH2CreditQueue {
+        const BULK: usize = 65 * 8192;
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (reset_tx, resets) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2io::server_builder()
+                .handshake::<_, Bytes>(server_io)
                 .await
                 .unwrap();
-            let paused = Arc::new(AtomicBool::new(false));
-            let driver_waker = Arc::new(Mutex::new(None::<std::task::Waker>));
-            let driver = {
-                let paused = paused.clone();
-                let driver_waker = driver_waker.clone();
-                tokio::spawn(async move {
-                    let _ = std::future::poll_fn(|cx| {
-                        *driver_waker.lock().unwrap() = Some(cx.waker().clone());
-                        if paused.load(Ordering::SeqCst) {
-                            Poll::Pending
-                        } else {
-                            Pin::new(&mut connection).poll(cx)
-                        }
-                    })
-                    .await;
-                })
-            };
-            let (response, _) = client
-                .send_request(
-                    http::Request::builder()
-                        .uri("http://localhost/bulk")
-                        .body(())
-                        .unwrap(),
-                    true,
+            while let Some(Ok((request, mut response))) = connection.accept().await {
+                let bulk = request.uri().path() == "/bulk";
+                let mut send = response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                send.send_data(
+                    if bulk {
+                        Bytes::from(vec![b'x'; BULK])
+                    } else {
+                        Bytes::from_static(b"ok")
+                    },
+                    !bulk,
                 )
                 .unwrap();
-            let mut body = response.await.unwrap().into_body();
-            let mut received = 0;
-            while received < BULK {
-                let bytes = body.data().await.unwrap().unwrap();
-                assert!(bytes.iter().all(|&byte| byte == b'x'));
-                received += bytes.len();
+                if bulk {
+                    let reset_tx = reset_tx.clone();
+                    tokio::spawn(async move {
+                        let reason = std::future::poll_fn(|cx| send.poll_reset(cx))
+                            .await
+                            .unwrap();
+                        reset_tx.send(reason).unwrap();
+                    });
+                }
             }
-            assert_eq!(received, BULK);
-            paused.store(true, Ordering::SeqCst);
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            for _ in 0..64 {
-                assert!(matches!(
-                    body.flow_control()
-                        .poll_release_capacity_exact(&mut cx, 8192),
-                    Poll::Ready(Ok(()))
-                ));
-            }
-            assert!(
+        });
+        let (mut client, mut connection) = h2io::client_builder()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        let (response, _) = client
+            .send_request(
+                http::Request::builder()
+                    .uri("http://localhost/bulk")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let mut body = tokio::select! {
+            body = async {
+                let mut body = response.await.unwrap().into_body();
+                let mut received = 0;
+                while received < BULK {
+                    let bytes = body.data().await.unwrap().unwrap();
+                    assert!(bytes.iter().all(|&byte| byte == b'x'));
+                    received += bytes.len();
+                }
+                assert_eq!(received, BULK);
+                body
+            } => body,
+            result = &mut connection => panic!("credit test connection exited: {result:?}"),
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..64 {
+            assert!(matches!(
                 body.flow_control()
-                    .poll_release_capacity_exact(&mut cx, 8192)
-                    .is_pending()
-            );
-            assert_eq!(body.flow_control().used_capacity(), 8192);
+                    .poll_release_capacity_exact(&mut cx, 8192),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(
+            body.flow_control()
+                .poll_release_capacity_exact(&mut cx, 8192)
+                .is_pending()
+        );
+        assert_eq!(body.flow_control().used_capacity(), 8192);
+        FullH2CreditQueue {
+            client,
+            connection,
+            body,
+            resets,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_h2_bounded_credit_keeps_neighbor_and_cancel_working() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let FullH2CreditQueue {
+                mut client,
+                connection,
+                mut body,
+                mut resets,
+                server,
+            } = full_h2_credit_queue().await;
             let (neighbor, _) = client
                 .send_request(
                     http::Request::builder()
@@ -4291,8 +4709,7 @@ mod tests {
                     true,
                 )
                 .unwrap();
-            paused.store(false, Ordering::SeqCst);
-            driver_waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+            let driver = tokio::spawn(connection);
             let response = neighbor.await.unwrap();
             let mut split = SplitConn::new(&cfg(json!({"mode":"packet-up"})));
             // A neighboring direct reader uses the same connection while the
@@ -4310,7 +4727,7 @@ mod tests {
             assert_eq!(bytes, b"ok");
             assert_eq!(body.flow_control().used_capacity(), 8192);
             drop(body);
-            assert_eq!(reset_rx.recv().await.unwrap(), h2::Reason::CANCEL);
+            assert_eq!(resets.recv().await.unwrap(), h2::Reason::CANCEL);
             drop(neighbor);
             drop(client);
             driver.abort();
@@ -4318,6 +4735,45 @@ mod tests {
         })
         .await
         .expect("bounded credit must not starve neighbor or cancellation");
+    }
+
+    #[tokio::test]
+    async fn h2_packet_up_idle_timeout_drains_pending_data_before_eof() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let FullH2CreditQueue {
+                client,
+                connection,
+                body,
+                mut resets,
+                server,
+            } = full_h2_credit_queue().await;
+            let mut split = SplitConn::new(&cfg(json!({"mode":"packet-up"})));
+            // The final 8 KiB chunk has been partly read, but there is no
+            // space to release the credit for the already consumed bytes.
+            split.pending = Bytes::from_static(b"xxxx");
+            split.direct_h2 = Some(DirectH2Download {
+                response: None,
+                body: Some(body),
+                credit_due: 8192 - split.pending.len(),
+            });
+            split.half_closed = Some(HalfClosed::new(std::time::Duration::ZERO));
+            let mut conn = XhttpConn {
+                split: Box::new(split),
+            };
+            let mut tail = Vec::new();
+            conn.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, b"xxxx");
+            assert_eq!(conn.read(&mut [0]).await.unwrap(), 0);
+
+            let driver = tokio::spawn(connection);
+            assert_eq!(resets.recv().await.unwrap(), h2::Reason::CANCEL);
+            drop(client);
+            driver.abort();
+            server.abort();
+        })
+        .await
+        .expect("half-close timeout must preserve received bytes before EOF");
     }
 
     #[tokio::test]

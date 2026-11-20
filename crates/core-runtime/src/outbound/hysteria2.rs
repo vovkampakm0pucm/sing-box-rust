@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::inbound::{AnyStream, Target, network_includes_tcp, network_includes_udp};
 use crate::logging;
+use crate::outbound::packet::{CloseUdpFlowOnDrop, UdpBridgePolicy};
 use crate::outbound::proxy::{server_endpoint, server_host};
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
@@ -28,7 +29,7 @@ pub(crate) const AUTH_STATUS_OK: u16 = 233;
 pub(crate) const FRAME_TCP_REQUEST: u64 = 0x401;
 pub(crate) const MAX_ADDRESS: usize = 2048;
 const MAX_MESSAGE: usize = 2048;
-const MAX_PADDING: usize = 4096;
+pub(crate) const MAX_PADDING: usize = 4096;
 const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(15);
 const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 
@@ -220,25 +221,29 @@ impl Hysteria2 {
         let mut pool = self.shared.lock().await;
         // hopping happens inside the connection (relay), so only closed ones go
         pool.retain(|s| s.conn.close_reason().is_none());
-        let best = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, s)| s.leases.load(Ordering::Relaxed));
-        let shared = match best {
-            Some((i, s))
+        let best = pool.iter().min_by_key(|s| s.leases.load(Ordering::Relaxed));
+        match best {
+            Some(s)
                 if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
                     || pool.len() >= POOL_MAX_CONNS =>
             {
-                Arc::clone(&pool[i])
+                Ok(Arc::clone(s))
             }
-            _ => {
-                let s = self.dial().await?;
-                s.start_demux();
-                pool.push(Arc::clone(&s));
-                Arc::clone(pool.last().expect("pushed"))
-            }
-        };
-        Ok(shared)
+            _ => match self.dial().await {
+                Ok(s) => {
+                    s.start_demux();
+                    pool.push(Arc::clone(&s));
+                    Ok(s)
+                }
+                // Leases and connection state can change while dialing.
+                Err(error) => pool
+                    .iter()
+                    .filter(|s| s.conn.close_reason().is_none())
+                    .min_by_key(|s| s.leases.load(Ordering::Relaxed))
+                    .cloned()
+                    .ok_or(error),
+            },
+        }
     }
 
     /// The reference paces its upload at the rate the config names and
@@ -447,43 +452,54 @@ impl Hysteria2 {
         let dest_f = dest.clone();
         let sess_f = Arc::clone(&session);
         let peer_f = Arc::clone(&peer);
-        // the flow's idle policy, route-options `udp_timeout` included
-        let udp_timeout = crate::outbound::packet::udp_bridge_timeout();
+        let policy = UdpBridgePolicy::current();
+        let udp_timeout = policy.timeout;
+        let close_flow = CloseUdpFlowOnDrop(policy.flow_close);
         // held across the spawn so the task's own removal comes after the insert
         let mut handles = shared.handles.lock().expect("handles");
         let handle = tokio::spawn(async move {
+            let _close_flow = close_flow;
             let _lease = lease;
             let check_interval = udp_timeout.min(Duration::from_secs(5));
-            loop {
-                // a shared per-thread buffer: an idle session keeps none
-                let sent = crate::inbound::udp::recv_with(&peer_f, |pkt| {
-                    send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f)
-                });
-                match tokio::time::timeout(check_interval, sent).await {
-                    Ok(Ok(sent)) => {
-                        sess_f
-                            .last_activity
-                            .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
-                        if let Err(e) = sent {
-                            logging::debug(format_args!("hysteria2 udp send {sid}: {e}"));
-                            // one bad packet is dropped; a dead connection ends the session
-                            if conn_f.close_reason().is_some() {
+            let forward = async {
+                loop {
+                    // a shared per-thread buffer: an idle session keeps none
+                    let sent = crate::inbound::udp::recv_with(&peer_f, |pkt| {
+                        send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f.packet_id)
+                    });
+                    match tokio::time::timeout(check_interval, sent).await {
+                        Ok(Ok(sent)) => {
+                            sess_f
+                                .last_activity
+                                .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
+                            if let Err(e) = sent {
+                                logging::debug(format_args!("hysteria2 udp send {sid}: {e}"));
+                                // one bad packet is dropped; a dead connection ends the session
+                                if conn_f.close_reason().is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            logging::debug(format_args!("hysteria2 udp recv {sid}: {e}"));
+                            break;
+                        }
+                        Err(_) => {
+                            let elapsed = crate::inbound::udp::now_ms()
+                                .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
+                            if elapsed >= udp_timeout.as_millis() as u64 {
                                 break;
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        logging::debug(format_args!("hysteria2 udp recv {sid}: {e}"));
-                        break;
-                    }
-                    Err(_) => {
-                        let elapsed = crate::inbound::udp::now_ms()
-                            .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
-                        if elapsed >= udp_timeout.as_millis() as u64 {
-                            break;
-                        }
-                    }
                 }
+            };
+            // A UDP socket has no EOF when its local peer disappears. End the
+            // bridge on QUIC close so the hub can reopen the flow on demand.
+            tokio::select! {
+                biased;
+                _ = conn_f.closed() => {}
+                _ = forward => {}
             }
             if let Some(shared) = shared_f.upgrade() {
                 shared.sessions.lock().expect("sessions").remove(&sid);
@@ -666,6 +682,17 @@ pub(crate) async fn read_varint_stream(recv: &mut quinn::RecvStream) -> io::Resu
     }
 }
 
+pub(crate) async fn read_bounded_length(
+    recv: &mut quinn::RecvStream,
+    maximum: usize,
+    field: &str,
+) -> io::Result<usize> {
+    usize::try_from(read_varint_stream(recv).await?)
+        .ok()
+        .filter(|&length| length <= maximum)
+        .ok_or_else(|| io::Error::other(format!("hysteria2: invalid {field} length")))
+}
+
 pub(crate) async fn read_exact_vec(recv: &mut quinn::RecvStream, n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let mut off = 0;
@@ -696,15 +723,9 @@ async fn read_tcp_response(recv: &mut quinn::RecvStream) -> io::Result<()> {
     recv.read_exact(&mut status)
         .await
         .map_err(|e| io::Error::other(format!("hysteria2: read status: {e}")))?;
-    let msg_len = read_varint_stream(recv).await? as usize;
-    if msg_len > MAX_MESSAGE {
-        return Err(io::Error::other("hysteria2: invalid message length"));
-    }
+    let msg_len = read_bounded_length(recv, MAX_MESSAGE, "message").await?;
     let msg = read_exact_vec(recv, msg_len).await?;
-    let pad_len = read_varint_stream(recv).await? as usize;
-    if pad_len > MAX_PADDING {
-        return Err(io::Error::other("hysteria2: invalid padding length"));
-    }
+    let pad_len = read_bounded_length(recv, MAX_PADDING, "padding").await?;
     let _pad = read_exact_vec(recv, pad_len).await?;
     if status[0] != 0 {
         return Err(io::Error::other(format!(
@@ -760,7 +781,7 @@ pub(crate) fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
     let frag_id = data[6];
     let frag_total = data[7];
     let (dest_len, n) = read_varint(&data[8..])?;
-    let dest_len = dest_len as usize;
+    let dest_len = usize::try_from(dest_len).ok()?;
     if dest_len == 0 || dest_len > MAX_ADDRESS {
         return None;
     }
@@ -781,17 +802,19 @@ pub(crate) fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
 
 pub(crate) type Hy2Packet<'a> = (u32, u16, u8, u8, &'a str, &'a [u8]);
 
-fn send_hy2_datagram(
+pub(crate) fn send_hy2_datagram(
     conn: &quinn::Connection,
     sid: u32,
     dest: &str,
     payload: &[u8],
-    sess: &UdpSession,
+    packet_id: &AtomicU32,
 ) -> io::Result<()> {
     if payload.len() > HY2_MAX_UDP {
-        return Err(io::Error::other("hysteria2: udp payload exceeds 4096"));
+        return Err(io::Error::other(format!(
+            "hysteria2: udp payload exceeds {HY2_MAX_UDP}"
+        )));
     }
-    let pid = next_packet_id(&sess.packet_id);
+    let pid = next_packet_id(packet_id);
     let header_len = 8 + varint_len(dest.len() as u64) + dest.len();
     let mut budget = conn.max_datagram_size().unwrap_or(1197);
     if payload.len() + header_len <= budget {
@@ -805,14 +828,11 @@ fn send_hy2_datagram(
         }
     }
     let max_data = budget.saturating_sub(header_len).max(1);
-    let chunks: Vec<&[u8]> = payload.chunks(max_data).collect();
-    if chunks.len() > 255 {
-        return Err(io::Error::other(
-            "hysteria2: udp packet needs too many fragments",
-        ));
-    }
-    for (i, chunk) in chunks.iter().enumerate() {
-        let pkt = pack_hy2(sid, pid, i as u8, chunks.len() as u8, dest, chunk);
+    let chunks = payload.chunks(max_data);
+    let count = u8::try_from(chunks.len())
+        .map_err(|_| io::Error::other("hysteria2: udp packet needs too many fragments"))?;
+    for (i, chunk) in chunks.enumerate() {
+        let pkt = pack_hy2(sid, pid, i as u8, count, dest, chunk);
         conn.send_datagram(pkt.into()).map_err(io_from_datagram)?;
     }
     Ok(())
@@ -1007,7 +1027,7 @@ mod tests {
     const CERT_PEM: &str = include_str!("../../../../tests/golden/certs/localhost.crt");
     const KEY_PEM: &str = include_str!("../../../../tests/golden/certs/localhost.key");
 
-    async fn udp_test_pair() -> (Hysteria2, std::net::SocketAddr) {
+    async fn start_test_client() -> Hysteria2 {
         let router = crate::route::Router::new(
             &serde_json::json!({"outbounds": [{"type": "direct", "tag": "direct"}]}),
         )
@@ -1022,6 +1042,16 @@ mod tests {
             .expect("bind hy2 inbound");
         let port = server.local_addr().expect("server addr").port();
         tokio::spawn(server.serve());
+        let cfg = serde_json::json!({
+            "type": "hysteria2", "tag": "hy2-out", "server": "127.0.0.1",
+            "server_port": port, "password": "udp-pass",
+            "tls": {"enabled": true, "insecure": true, "server_name": "localhost"}
+        });
+        Hysteria2::build(cfg.as_object().unwrap(), "out").unwrap()
+    }
+
+    async fn udp_test_pair() -> (Hysteria2, std::net::SocketAddr) {
+        let out = start_test_client().await;
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind udp echo");
@@ -1032,13 +1062,114 @@ mod tests {
                 let _ = echo.send_to(&buf[..n], from).await;
             }
         });
-        let cfg = serde_json::json!({
-            "type": "hysteria2", "tag": "hy2-out", "server": "127.0.0.1",
-            "server_port": port, "password": "udp-pass",
-            "tls": {"enabled": true, "insecure": true, "server_name": "localhost"}
-        });
-        let out = Hysteria2::build(cfg.as_object().unwrap(), "out").unwrap();
         (out, echo_addr)
+    }
+
+    #[tokio::test]
+    async fn udp_replies_stay_in_their_quic_sessions() {
+        let (out, echo) = udp_test_pair().await;
+        let target = Target::Ip(echo);
+        let first = out.connect_udp(&target).await.expect("first UDP session");
+        let second = out.connect_udp(&target).await.expect("second UDP session");
+        let connection = {
+            let pool = out.shared.lock().await;
+            assert_eq!(pool.len(), 1, "both sessions must share one connection");
+            assert_eq!(pool[0].sessions.lock().unwrap().len(), 2);
+            pool[0].conn.clone()
+        };
+
+        for (socket, payload) in [(&first, b"first"), (&second, b"other")] {
+            socket.send(payload).await.expect("send datagram");
+        }
+        async fn expect_reply(socket: &tokio::net::UdpSocket, payload: &[u8]) {
+            let mut buf = [0; 64];
+            let size = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf))
+                .await
+                .expect("UDP session did not receive its reply")
+                .expect("UDP receive");
+            assert_eq!(&buf[..size], payload);
+        }
+        expect_reply(&first, b"first").await;
+        expect_reply(&second, b"other").await;
+
+        // Packet IDs are per session. Both sessions use the same ID while
+        // the server has unfinished fragments for both.
+        let dest = echo.to_string();
+        for (session, fragment, payload) in [
+            (0, 0, &b"first-"[..]),
+            (1, 0, &b"other-"[..]),
+            (0, 1, &b"payload"[..]),
+            (1, 1, &b"message"[..]),
+        ] {
+            connection
+                .send_datagram(pack_hy2(session, 7, fragment, 2, &dest, payload).into())
+                .expect("send fragment");
+        }
+        expect_reply(&first, b"first-payload").await;
+        expect_reply(&second, b"other-message").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_pool_expansion_reuses_an_open_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut out = start_test_client().await;
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::Ip(echo.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = echo.accept().await {
+                let (mut read, mut write) = socket.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+
+        let mut buf = [0; 8];
+        let mut streams = Vec::new();
+        for payload in [b"first", b"other"] {
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), out.connect(&target))
+                .await
+                .expect("existing stream connect timeout")
+                .expect("existing stream");
+            stream.write_all(payload).await.expect("send");
+            let received = &mut buf[..payload.len()];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(received))
+                .await
+                .expect("existing stream echo timeout")
+                .expect("read echo");
+            assert_eq!(&buf[..payload.len()], payload);
+            streams.push(stream);
+        }
+        {
+            let pool = out.shared.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert_eq!(
+                pool[0].leases.load(Ordering::Relaxed),
+                POOL_STREAMS_PER_CONN
+            );
+        }
+
+        // Reserve the port so only new dials fail. The established QUIC
+        // connection still talks to the original server and can carry a new stream.
+        let unanswered = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        out.port = unanswered.local_addr().unwrap().port();
+        out.connect_timeout = Duration::from_millis(100);
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), out.connect(&target))
+            .await
+            .expect("fallback stream connect timeout")
+            .expect("reuse open connection");
+        tokio::time::timeout(Duration::from_secs(1), unanswered.recv_from(&mut buf))
+            .await
+            .expect("pool expansion did not attempt a fresh dial")
+            .expect("receive fresh dial");
+        stream.write_all(b"fallback").await.expect("send");
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("fallback stream echo timeout")
+            .expect("read echo");
+        assert_eq!(&buf, b"fallback");
+        drop(streams);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1046,9 +1177,12 @@ mod tests {
         let (out, echo) = udp_test_pair().await;
         let mut socks = Vec::new();
         for _ in 0..32 {
-            let sock = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+            let sock = crate::outbound::packet::UDP_BRIDGE_POLICY
                 .scope(
-                    Duration::from_millis(300),
+                    crate::outbound::packet::UdpBridgePolicy {
+                        timeout: Duration::from_millis(300),
+                        flow_close: None,
+                    },
                     out.connect_udp(&Target::Ip(echo)),
                 )
                 .await
@@ -1075,22 +1209,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_oversize_datagram_does_not_end_session() {
+    async fn udp_fragmented_datagram_does_not_end_session() {
         let (out, echo) = udp_test_pair().await;
         let sock = out.connect_udp(&Target::Ip(echo)).await.expect("udp");
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 8192];
         sock.send(b"before").await.expect("send");
         let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
             .await
             .expect("echo before")
             .expect("recv");
         assert_eq!(&buf[..n], b"before");
-        // past the hysteria2 UDP size limit: this one packet is lost
-        sock.send(&[7u8; 5000]).await.expect("send oversize");
+        let fragmented = [7u8; 5000];
+        sock.send(&fragmented).await.expect("send fragmented");
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+            .await
+            .expect("echo fragmented")
+            .expect("recv");
+        assert_eq!(&buf[..n], &fragmented);
         sock.send(b"after").await.expect("send");
         let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
             .await
-            .expect("the session must survive an oversize datagram")
+            .expect("the session must survive a fragmented datagram")
             .expect("recv");
         assert_eq!(&buf[..n], b"after");
     }

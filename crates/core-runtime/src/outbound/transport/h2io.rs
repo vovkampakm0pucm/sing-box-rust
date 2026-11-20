@@ -414,7 +414,11 @@ impl H2Stream {
 
     /// Wait for the next received chunk into `pending`.
     /// `Ok(false)` means the response body ended (EOF latched).
-    pub(crate) fn poll_recv_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    pub(crate) fn poll_recv_more(
+        &mut self,
+        cx: &mut Context<'_>,
+        check_head: impl FnOnce(&http::HeaderMap) -> io::Result<()>,
+    ) -> Poll<io::Result<bool>> {
         if self.recv.is_none() {
             let Some(response) = self.response.as_mut() else {
                 // Response already consumed; recv stream exhausted.
@@ -433,8 +437,10 @@ impl H2Stream {
                     resp.status()
                 ))));
             }
+            let checked = check_head(resp.headers());
             self.recv = Some(resp.into_body());
             self.response = None;
+            checked?;
         }
         let recv = self.recv.as_mut().expect("recv set above");
         match recv.poll_data(cx) {
@@ -444,8 +450,12 @@ impl H2Stream {
                 // pushed as it arrived: no join, no copy of either side.
                 // Capacity is repaid when the bytes leave `pending`, not
                 // while we are still holding them.
-                self.pending.push_back(chunk);
-                self.pending_len += len;
+                // An empty DATA event is not EOF. Keeping it in pending
+                // would wake a reader with a nonempty deque and zero bytes.
+                if len != 0 {
+                    self.pending.push_back(chunk);
+                    self.pending_len += len;
+                }
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -456,6 +466,17 @@ impl H2Stream {
                 Poll::Ready(Ok(false))
             }
         }
+    }
+
+    pub(crate) fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<http::HeaderMap>>> {
+        let Some(recv) = self.recv.as_mut() else {
+            return Poll::Ready(Ok(None));
+        };
+        recv.poll_trailers(cx)
+            .map_err(|e| io::Error::other(format!("h2: recv trailers: {e}")))
     }
 
     pub(crate) fn is_eof(&self) -> bool {
@@ -864,7 +885,7 @@ mod backpressure_tests {
         // Poll without consuming, as gRPC's header parser does while buffering.
         tokio::time::timeout(
             Duration::from_secs(3),
-            std::future::poll_fn(|cx| io.h2.poll_recv_more(cx)),
+            std::future::poll_fn(|cx| io.h2.poll_recv_more(cx, |_| Ok(()))),
         )
         .await
         .expect("buffer second frame deadline")
@@ -1197,6 +1218,38 @@ mod settings_tests {
 pub(crate) struct H2Counter {
     active: std::sync::atomic::AtomicUsize,
     notify: std::sync::Arc<tokio::sync::Notify>,
+    activity: tokio::sync::Notify,
+}
+
+impl H2Counter {
+    fn add_stream(&self) {
+        if self.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            self.activity.notify_waiters();
+        }
+    }
+
+    fn release_stream(&self) {
+        if self.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            self.activity.notify_waiters();
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn has_streams(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    async fn wait_for_streams(&self, active: bool) {
+        loop {
+            let notified = self.activity.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_streams() == active {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl std::ops::Deref for H2Counter {
@@ -1252,9 +1305,7 @@ impl TrackedStream {
 
 impl Drop for TrackedStream {
     fn drop(&mut self) {
-        self.counter
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.counter.notify.notify_waiters();
+        self.counter.release_stream();
     }
 }
 
@@ -1307,8 +1358,7 @@ impl CounterGuard {
 impl Drop for CounterGuard {
     fn drop(&mut self) {
         if let Some(c) = self.0.take() {
-            c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            c.notify.notify_waiters();
+            c.release_stream();
         }
     }
 }
@@ -1367,7 +1417,7 @@ impl H2Pool {
                     if let Some(best) = best {
                         let client = best.client.clone();
                         let active = best.active_streams.clone();
-                        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        active.add_stream();
                         Some((client, active))
                     } else {
                         None
@@ -1427,6 +1477,7 @@ impl H2Pool {
             let cnt = std::sync::Arc::new(H2Counter {
                 active: std::sync::atomic::AtomicUsize::new(1),
                 notify: self.notify.clone(),
+                activity: tokio::sync::Notify::new(),
             });
             if guard.clients.len() >= max_conns {
                 guard.clients.remove(0);
@@ -1601,6 +1652,65 @@ pub(crate) async fn h2_handshake(
     Ok((send_request, connection, clock))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct H2KeepAlive {
+    pub period: std::time::Duration,
+    pub timeout: std::time::Duration,
+    pub permit_without_stream: bool,
+}
+
+impl H2KeepAlive {
+    pub(crate) fn always(period: std::time::Duration, timeout: std::time::Duration) -> Self {
+        Self {
+            period,
+            timeout,
+            permit_without_stream: true,
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn keep_alive_without_streams_respects_the_gating_option() {
+    use std::time::Duration;
+    for permit_without_stream in [false, true] {
+        let (client, _silent_peer) = tokio::io::duplex(4096);
+        let (send, connection, clock) = h2_handshake(Box::new(client), &client_builder(), "test")
+            .await
+            .unwrap();
+        let pool = std::sync::Arc::new(H2Pool::new());
+        let counter = pool.finish_dial(Some(send), 1).await.unwrap();
+        drop(CounterGuard::new(counter.clone()));
+        let keep_alive = H2KeepAlive {
+            period: Duration::from_millis(25),
+            timeout: Duration::from_millis(25),
+            permit_without_stream,
+        };
+        let driver = tokio::spawn(drive_h2_connection(
+            connection,
+            clock,
+            Some(keep_alive),
+            std::sync::Arc::downgrade(&pool),
+            counter.clone(),
+            None,
+            "test",
+        ));
+        let _stream = if permit_without_stream {
+            None
+        } else {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(!driver.is_finished(), "an idle connection must stay open");
+            counter.add_stream();
+            Some(CounterGuard::new(counter))
+        };
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("configured probe did not evict the silent connection")
+            .unwrap();
+        assert_eq!(pool.pooled(), 0);
+    }
+}
+
 /// Returns once the connection fails its liveness check, as Xray's
 /// `ReadIdleTimeout` does: after `period` with nothing read, send a PING and
 /// give it `ping_timeout` ([`H2_PING_TIMEOUT`]). A connection that keeps delivering frames is
@@ -1609,20 +1719,34 @@ pub(crate) async fn h2_handshake(
 async fn h2_keep_alive(
     ping_pong: &mut h2::PingPong,
     clock: &ReadClock,
-    period: std::time::Duration,
-    ping_timeout: std::time::Duration,
+    counter: &H2Counter,
+    keep_alive: H2KeepAlive,
 ) -> &'static str {
+    let mut resumed = None;
     loop {
+        if !keep_alive.permit_without_stream && !counter.has_streams() {
+            counter.wait_for_streams(true).await;
+            resumed = Some(tokio::time::Instant::now());
+        }
         let idle = clock.idle();
-        if idle < period {
-            tokio::time::sleep(period - idle).await;
+        let idle = resumed.map_or(idle, |start| idle.min(start.elapsed()));
+        if idle < keep_alive.period {
+            let probe_at = tokio::time::sleep(keep_alive.period - idle);
+            if keep_alive.permit_without_stream {
+                probe_at.await;
+            } else {
+                tokio::select! {
+                    _ = probe_at => {}
+                    _ = counter.wait_for_streams(false) => {}
+                }
+            }
             continue;
         }
         let mut seen = clock.last();
         let ping = ping_pong.ping(h2::Ping::opaque());
         tokio::pin!(ping);
         loop {
-            match tokio::time::timeout(ping_timeout, ping.as_mut()).await {
+            match tokio::time::timeout(keep_alive.timeout, ping.as_mut()).await {
                 Ok(Ok(_)) => break,
                 Ok(Err(_)) => return "ping failed",
                 Err(_) if clock.last() != seen => seen = clock.last(),
@@ -1638,7 +1762,7 @@ async fn h2_keep_alive(
 pub(crate) async fn drive_h2_connection(
     mut connection: H2Connection,
     clock: std::sync::Arc<ReadClock>,
-    keep_alive: Option<(std::time::Duration, std::time::Duration)>,
+    keep_alive: Option<H2KeepAlive>,
     pool: std::sync::Weak<H2Pool>,
     counter: std::sync::Arc<H2Counter>,
     idle_limit: Option<std::time::Duration>,
@@ -1653,14 +1777,14 @@ pub(crate) async fn drive_h2_connection(
     };
     tokio::pin!(idle);
     match ping_pong {
-        Some((mut ping_pong, (period, ping_timeout))) => {
+        Some((mut ping_pong, keep_alive)) => {
             tokio::select! {
                 res = &mut connection => {
                     if let Err(e) = res {
                         crate::logging::debug(format_args!("{label} h2 connection: {e}"));
                     }
                 }
-                why = h2_keep_alive(&mut ping_pong, &clock, period, ping_timeout) => {
+                why = h2_keep_alive(&mut ping_pong, &clock, &counter, keep_alive) => {
                     crate::logging::debug(format_args!("{label} h2 connection: {why}, closing"));
                 }
                 why = &mut idle => {

@@ -22,8 +22,8 @@ use crate::util::random_bytes;
 
 /// Reference `hysteria.MbpsToBps`.
 pub(crate) const MBPS_TO_BPS: u64 = 125_000;
-/// Reference `protocol.MaxUDPSize` (hy2).
-pub(crate) const HY2_MAX_UDP: usize = 4096;
+/// Maximum application payload of an IPv4 UDP datagram.
+pub(crate) const HY2_MAX_UDP: usize = 65_507;
 
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -578,7 +578,7 @@ fn open_salamander_datagrams(password: &[u8], buf: &mut [u8], stride: usize) -> 
 /// individual datagram, including when the kernel coalesces receives.
 pub(crate) struct SalamanderSocket {
     socket: Arc<dyn quinn::AsyncUdpSocket>,
-    peer: SocketAddr,
+    peer: Option<SocketAddr>,
     password: Vec<u8>,
     sealed: std::sync::Mutex<Vec<u8>>,
 }
@@ -622,7 +622,21 @@ impl SalamanderSocket {
         }
         Ok(Self {
             socket,
-            peer,
+            peer: Some(peer),
+            password,
+            sealed: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn listen(
+        runtime: &dyn quinn::Runtime,
+        udp: std::net::UdpSocket,
+        password: Vec<u8>,
+    ) -> io::Result<Self> {
+        udp.set_nonblocking(true)?;
+        Ok(Self {
+            socket: runtime.wrap_udp_socket(udp)?,
+            peer: None,
             password,
             sealed: std::sync::Mutex::new(Vec::new()),
         })
@@ -677,7 +691,7 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
             ecn: None,
             contents: &sealed,
             segment_size: segment.map(|size| size + 8),
-            src_ip: None,
+            src_ip: if self.peer.is_none() { tx.src_ip } else { None },
         })
     }
 
@@ -689,17 +703,19 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
     ) -> Poll<io::Result<usize>> {
         let count = std::task::ready!(self.socket.poll_recv(cx, bufs, meta))?;
         for (buf, meta) in bufs.iter_mut().zip(&mut meta[..count]) {
-            if meta.addr.ip() != self.peer.ip() || meta.stride <= 8 {
+            if self.peer.is_some_and(|peer| meta.addr.ip() != peer.ip()) || meta.stride <= 8 {
                 meta.len = 0;
                 continue;
             }
             meta.len = open_salamander_datagrams(&self.password, &mut buf[..meta.len], meta.stride);
             meta.stride -= 8;
-            // As with the relay, accept replies from the configured IP and
-            // present a stable peer address, without relaying ECN markings.
-            meta.addr = self.peer;
+            // The client keeps its stable peer address. A listener must
+            // retain the actual source and local destination for each client.
+            if let Some(peer) = self.peer {
+                meta.addr = peer;
+                meta.dst_ip = None;
+            }
             meta.ecn = None;
-            meta.dst_ip = None;
         }
         Poll::Ready(Ok(count))
     }
@@ -716,7 +732,11 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.socket.max_transmit_segments().clamp(1, 16)
+        if self.peer.is_some() {
+            self.socket.max_transmit_segments().clamp(1, 16)
+        } else {
+            1
+        }
     }
 
     fn may_fragment(&self) -> bool {
@@ -791,14 +811,14 @@ mod salamander_gso_tests {
         let password = b"fallback-formula";
         let sender = Arc::new(SalamanderSocket {
             socket: backend.clone(),
-            peer: backend.local_addr().unwrap(),
+            peer: Some(backend.local_addr().unwrap()),
             password: password.to_vec(),
             sealed: std::sync::Mutex::new(Vec::new()),
         });
         assert_eq!(sender.max_transmit_segments(), 16);
         let data = b"aaaabbbbcc";
         let tx = quinn::udp::Transmit {
-            destination: sender.peer,
+            destination: sender.peer.unwrap(),
             ecn: None,
             contents: data,
             segment_size: Some(4),
@@ -824,7 +844,7 @@ mod salamander_gso_tests {
         ] {
             sender
                 .try_send(&quinn::udp::Transmit {
-                    destination: sender.peer,
+                    destination: sender.peer.unwrap(),
                     ecn: None,
                     contents,
                     segment_size,
@@ -862,7 +882,7 @@ mod salamander_gso_tests {
         drop(sent);
         for size in [0, usize::from(u16::MAX) - 7, usize::MAX] {
             let invalid = quinn::udp::Transmit {
-                destination: sender.peer,
+                destination: sender.peer.unwrap(),
                 ecn: None,
                 contents: b"x",
                 segment_size: Some(size),
@@ -874,7 +894,7 @@ mod salamander_gso_tests {
             );
         }
         let invalid = quinn::udp::Transmit {
-            destination: sender.peer,
+            destination: sender.peer.unwrap(),
             ecn: None,
             contents: &[0; 17],
             segment_size: Some(1),
@@ -1558,7 +1578,7 @@ impl VarintReader {
     }
 }
 
-/// Per-session fragment reassembler (hy2 PACKET frames).
+/// Fragment reassembler for HY2 datagrams, keyed by packet identity.
 ///
 /// Fragments are `Bytes`: a slice of the datagram is shared by reference
 /// count, so a single-fragment packet -- the overwhelmingly common case --
@@ -1568,25 +1588,25 @@ impl VarintReader {
 /// Only a few packets are held in assembly (upstream Hysteria keeps one):
 /// a new packet past [`DEFRAG_MAX_PENDING`] drops the oldest unfinished one,
 /// and a packet whose fragments add up past the largest UDP payload is
-/// dropped, so a lossy or hostile peer cannot grow the session's memory.
-pub(crate) struct Defragger {
+/// dropped, so a lossy or hostile peer cannot grow the buffer indefinitely.
+pub(crate) struct Defragger<K = u16> {
     // unfinished packets, oldest first
-    items: std::collections::VecDeque<PendingPacket>,
+    items: std::collections::VecDeque<PendingPacket<K>>,
 }
 
-/// Unfinished packets one session keeps.
+/// Unfinished packets one reassembler keeps.
 const DEFRAG_MAX_PENDING: usize = 4;
 /// Largest reassembled packet: one UDP payload.
 const DEFRAG_MAX_BYTES: usize = 0xffff;
 
-struct PendingPacket {
-    id: u16,
+struct PendingPacket<K> {
+    id: K,
     slots: Vec<Option<bytes::Bytes>>,
     received: usize,
     size: usize,
 }
 
-impl Defragger {
+impl<K: PartialEq> Defragger<K> {
     pub fn new() -> Self {
         Self {
             items: std::collections::VecDeque::new(),
@@ -1596,7 +1616,7 @@ impl Defragger {
     /// Feed one fragment; returns the reassembled payload when complete.
     pub fn feed(
         &mut self,
-        packet_id: u16,
+        packet_id: K,
         frag_id: u8,
         frag_total: u8,
         data: bytes::Bytes,
