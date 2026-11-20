@@ -49,7 +49,7 @@ jobs:
       - name: Fetch reference sing-box-lx
         run: |
           curl -fsSL -o ref.tar.gz \
-            "https://github.com{SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
+            "https://github.com/Leadaxe/sing-box-lx/releases/download/${SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
           mkdir -p "$HOME/ref" && tar -xzf ref.tar.gz -C "$HOME/ref"
           REF_BIN="$(find "$HOME/ref" -type f -name sing-box | head -1)"
           chmod +x "$REF_BIN"
