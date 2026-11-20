@@ -1696,7 +1696,7 @@ index 0000000..7dee09c
 +        let mode = self.packet_encoding;
 +        let first = self.request(
 +            mode.command(),
-+            &mode.request_target(target),
++            &mode.request_target(target)?,
 +            &request_key,
 +            &request_iv,
 +            response_header[0],
